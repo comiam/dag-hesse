@@ -1,0 +1,98 @@
+[project]
+name = "dag-hesse"
+version = "0.1.0"
+description = "DAG Hessian structure analysis for deep networks"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Maxim Bolshim", email = "maxim.bolshim@yandex.ru"},
+    {name = "Alexander Kugaevskikh", email = "a-kugaevskikh@yandex.ru"},
+]
+keywords = ["hessian", "neural-networks", "dag-architecture", "gauss-newton", "second-order-optimization"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.0",
+    "numpy>=1.24",
+    "matplotlib>=3.7",
+    "torchvision>=0.15",
+    "scipy>=1.10",
+]
+
+[project.urls]
+Repository = "https://github.com/comiam/dag-hesse"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.10",
+    "flake8>=7.0",
+    "ruff>=0.4",
+    "black>=24.0",
+    "pytest>=8.0",
+]
+
+[tool.black]
+line-length = 88
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+]
+ignore = [
+    "E501",   # line too long (handled by black)
+    "E741",   # ambiguous variable name (common in math code: l, O, I)
+    "W605",   # invalid escape sequence (handled by ruff UP)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["hessian", "experiments", "paper_data"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = false
+warn_unused_configs = true
+disallow_untyped_defs = false
+check_untyped_defs = true
+ignore_missing_imports = true
+no_implicit_optional = true
+explicit_package_bases = true
+mypy_path = "."
+
+[[tool.mypy.overrides]]
+module = [
+    "torch.*",
+    "torchvision.*",
+    "numpy.*",
+    "matplotlib.*",
+    "scipy.*",
+]
+ignore_missing_imports = true
+
+[tool.flake8]
+max-line-length = 88
+extend-ignore = ["E203", "E501", "W503", "E741"]
+per-file-ignores = [
+    "__init__.py:F401",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["hessian/tests"]
