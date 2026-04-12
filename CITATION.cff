@@ -3,6 +3,11 @@ title: "DAG-Hesse: Inter-Layer Hessian Analysis of Neural Networks with DAG Arch
 message: "If you use this software, please cite it using the metadata from this file."
 type: software
 license: MIT
+doi: "10.5281/zenodo.19545553"
+identifiers:
+  - type: doi
+    value: "10.5281/zenodo.19545554"
+    description: "Version 1.0.0"
 authors:
   - given-names: Maxim
     family-names: Bolshim

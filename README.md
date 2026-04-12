@@ -2,6 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![DOI](https://zenodo.org/badge/1208847889.svg)](https://doi.org/10.5281/zenodo.19545553)
 
 Code and experimental results for the paper:
 
@@ -123,6 +124,7 @@ If you use this code in your research, please cite:
   author  = {Bolshim, Maxim and Kugaevskikh, Alexander},
   journal = {Neural Networks},
   year    = {2026},
+  doi     = {10.5281/zenodo.19545553},
   note    = {Submitted}
 }
 ```
