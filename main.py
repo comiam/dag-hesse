@@ -7,6 +7,7 @@ Subcommands:
   exp4  - Diamond MLP: activation of the tensor term T_{u;v,w}.
   exp5  - Toy-Attention vs ReLU-MLP: verification of H^T_{Q,K} != 0.
   exp6  - ResNet-18 conv: GN-Gap and R/C decay in a convolutional DAG.
+  exp7  - COUPLE-FAC overlay optimization (K-FAC + coupling-gated correction).
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import argparse
 import json
 import logging
 import os
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +29,7 @@ from experiments.config import (
     Exp4Config,
     Exp5Config,
     Exp6Config,
+    Exp7Config,
     HessianConfig,
     TrainingConfig,
 )
@@ -56,6 +59,7 @@ from experiments.runner_exp3 import Exp3Runner
 from experiments.runner_exp4 import Exp4Runner
 from experiments.runner_exp5 import Exp5Runner
 from experiments.runner_exp6 import Exp6Runner
+from experiments.runner_exp7 import Exp7Runner
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -66,8 +70,8 @@ logger = logging.getLogger(__name__)
 # ======================================================================
 
 
-def _add_common_args(parser: argparse.ArgumentParser) -> None:
-    """Registers arguments shared by all experiments."""
+def _add_device_args(parser: argparse.ArgumentParser) -> None:
+    """Registers device / output arguments shared by every subcommand."""
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument(
         "--gpu",
@@ -77,6 +81,11 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         help="CUDA GPU index (e.g. --gpu 1). Overrides --device to cuda.",
     )
     parser.add_argument("--output-dir", type=str, default=None)
+
+
+def _add_common_args(parser: argparse.ArgumentParser) -> None:
+    """Registers arguments shared by the diagnostic experiments (exp1-exp6)."""
+    _add_device_args(parser)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument(
         "--hessian-mode",
@@ -603,6 +612,107 @@ def _run_exp6(args: argparse.Namespace) -> None:
 
 
 # ======================================================================
+# Exp7: COUPLE-FAC overlay optimization (the repair experiment)
+# ======================================================================
+
+# Class count per exp7 dataset; keeps the backbone head consistent when
+# --dataset overrides the profile default.
+_EXP7_NUM_CLASSES = {
+    "stanford_cars": 196,
+    "cifar10": 10,
+    "cifar100": 100,
+    "imagenet32": 1000,
+}
+
+
+def _add_exp7_args(parser: argparse.ArgumentParser) -> None:
+    _add_device_args(parser)
+    parser.add_argument(
+        "--profile",
+        type=str,
+        default="b1",
+        choices=["b1", "b2"],
+        help="b1: pretrained ResNet-50 finetune on Stanford Cars (headline); "
+        "b2: large-batch ResNet from scratch on ImageNet-32 (control).",
+    )
+    # Optional overrides; a value of None leaves the profile default untouched.
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        choices=["stanford_cars", "cifar10", "cifar100", "imagenet32"],
+    )
+    parser.add_argument(
+        "--model", type=str, default=None, choices=["resnet50", "resnet18"]
+    )
+    parser.add_argument("--methods", type=str, nargs="+", default=None)
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--seeds", type=int, nargs="+", default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--tau", type=float, default=None)
+    parser.add_argument("--overlay-rank", type=int, default=None)
+    parser.add_argument("--damping", type=float, default=None)
+    parser.add_argument("--measure-period", type=int, default=None)
+    parser.add_argument("--target-acc", type=float, default=None)
+
+
+def _make_exp7_config(args: argparse.Namespace) -> Exp7Config:
+    """Selects the regime profile, then applies any explicit CLI overrides."""
+    if args.profile == "b1":
+        base = Exp7Config.b1_cars()
+    else:
+        base = Exp7Config.b2_largebatch()
+
+    training = replace(
+        base.training,
+        **{
+            key: value
+            for key, value in {
+                "epochs": args.epochs,
+                "seeds": args.seeds,
+                "batch_size": args.batch_size,
+                "lr": args.lr,
+            }.items()
+            if value is not None
+        },
+    )
+
+    overrides: dict[str, Any] = {
+        key: value
+        for key, value in {
+            "dataset": args.dataset,
+            "model": args.model,
+            "methods": args.methods,
+            "tau": args.tau,
+            "overlay_rank": args.overlay_rank,
+            "damping": args.damping,
+            "measure_period": args.measure_period,
+            "target_acc": args.target_acc,
+        }.items()
+        if value is not None
+    }
+    # A dataset switch implies its class count (keeps the head consistent).
+    if "dataset" in overrides:
+        overrides["num_classes"] = _EXP7_NUM_CLASSES[overrides["dataset"]]
+
+    return replace(base, training=training, **overrides)
+
+
+def _run_exp7(args: argparse.Namespace) -> None:
+    device = _resolve_device(args)
+    logger.info("Device: %s", device)
+
+    config = _make_exp7_config(args)
+    runner = Exp7Runner(config, device)
+    results = runner.run()
+
+    out_dir = Path(args.output_dir or f"results/exp7_{args.profile}")
+    _save_results(results, out_dir)
+    logger.info("Exp7 done. Results in %s", out_dir)
+
+
+# ======================================================================
 # CLI entry point
 # ======================================================================
 
@@ -652,6 +762,12 @@ def main() -> None:
     _add_common_args(p6)
     _add_exp6_args(p6)
 
+    # exp7
+    p7 = subparsers.add_parser(
+        "exp7", help="COUPLE-FAC overlay optimization (repair experiment)"
+    )
+    _add_exp7_args(p7)
+
     args = parser.parse_args()
 
     dispatch = {
@@ -662,6 +778,7 @@ def main() -> None:
         "exp4": _run_exp4,
         "exp5": _run_exp5,
         "exp6": _run_exp6,
+        "exp7": _run_exp7,
     }
     dispatch[args.experiment](args)
 

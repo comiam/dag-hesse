@@ -181,3 +181,97 @@ class Exp6Config:
     checkpoint_epochs: list[str] = field(
         default_factory=lambda: ["init", "mid", "final"]
     )
+
+
+@dataclass
+class Exp7Config:
+    """Exp7: COUPLE-FAC overlay optimization (the repair experiment; "Stage B" in the plan).
+
+    COUPLE-FAC augments a block-diagonal K-FAC step with a low-rank cross-block
+    Newton correction restricted to the strongly-coupled subset
+    S = {(v, w) : C_{vw} > tau}, then accepts it only inside a trust region when an
+    exact-HVP quadratic model improves, m(d_overlay) <= m(d_KFAC) (no-harm safeguard).
+    Hyperparameters follow the revision plan: overlay rank r <= 4, coupling-measurement
+    period T >= 20, and at least five seeds (inherited from `TrainingConfig`).
+
+    Two regimes share this schema (the "adaptive" fac/dag split):
+      B1 (fine-grained finetune, the headline) - an ImageNet-pretrained ResNet-50 fully
+        finetuned on Stanford Cars (196 classes, ~8k train) at 224x224; see `b1_cars`.
+      B2 (large-batch from scratch, the control) - a ResNet trained from random init
+        with large batches B in {1024, 4096} on ImageNet-32 (32x32); see `b2_largebatch`.
+
+    The CIFAR loaders and `TrainingConfig` defaults are reused unchanged; only the
+    `dataset`/resolution/optimizer knobs are adapted per regime.
+    """
+
+    # Data / backbone
+    dataset: str = (
+        "stanford_cars"  # "stanford_cars" | "cifar10" | "cifar100" | "imagenet32"
+    )
+    num_classes: int = 196
+    model: str = "resnet50"  # backbone registry key
+    pretrained: bool = True  # ImageNet init (B1); False for from-scratch (B2)
+    image_size: int = 224
+    augment: bool = True
+
+    # COUPLE-FAC overlay + trust-region safeguard + K-FAC provider
+    tau: float = 0.1  # coupling-selection threshold S = {C_{vw} > tau}
+    overlay_rank: int = 4  # rank r <= 4 of the 2x2 block-Newton correction
+    overlay_n_power_iter: int = 12  # power iterations for the low-rank overlay build
+    measure_period: int = 20  # T >= 20: re-measure coupling C every T steps
+    coupling_n_probes: int = 30  # Hutchinson probes for the coupling estimate
+    tr_radius: float = float("inf")  # trust-region radius for the no-harm safeguard
+    damping: float = 1e-2  # K-FAC Tikhonov damping
+    fisher_type: str = "type-2"  # curvlinops K-FAC Fisher type
+
+    # Comparison + demonstration
+    methods: list[str] = field(
+        default_factory=lambda: [
+            "sgd",
+            "adam",
+            "kfac",
+            "kfac+overlay",
+            "newton_cg",
+        ]
+    )
+    target_acc: float = 0.9  # validation accuracy for the "speed to target" metric
+    training: TrainingConfig = field(
+        default_factory=lambda: TrainingConfig(
+            lr=0.01,
+            batch_size=64,
+            epochs=30,
+            optimizer="sgd",
+            momentum=0.9,
+            weight_decay=1e-4,
+            scheduler="cosine",
+        )
+    )
+
+    @classmethod
+    def b1_cars(cls) -> Exp7Config:
+        """B1 headline: ImageNet-pretrained ResNet-50 full finetune on Stanford Cars."""
+        return cls()
+
+    @classmethod
+    def b2_largebatch(cls, batch_size: int = 1024) -> Exp7Config:
+        """B2 control: large-batch ResNet trained from scratch on ImageNet-32 (32x32).
+
+        Learning rate follows the linear scaling rule lr = 0.1 * B / 256
+        (Goyal et al., 2017), keeping the per-sample step size batch-invariant.
+        """
+        return cls(
+            dataset="imagenet32",
+            num_classes=1000,
+            pretrained=False,
+            image_size=32,
+            target_acc=0.5,
+            training=TrainingConfig(
+                lr=0.1 * batch_size / 256,
+                batch_size=batch_size,
+                epochs=50,
+                optimizer="sgd",
+                momentum=0.9,
+                weight_decay=5e-4,
+                scheduler="cosine",
+            ),
+        )

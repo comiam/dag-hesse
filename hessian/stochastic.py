@@ -24,6 +24,7 @@ from collections.abc import Callable
 import torch
 from torch import Tensor
 
+from ._estimators import HVPClosure, hutchinson_frob_sq, power_iteration_spectral_sq
 from .exact import SegmentedModel
 from .types import LayerID
 
@@ -180,6 +181,29 @@ class StochasticHessianEstimator:
 
         return frob_sq / spectral_sq
 
+    @staticmethod
+    def _hvp_closure(
+        grad_src: Tensor,
+        src_graph: Tensor,
+        target: Tensor,
+    ) -> HVPClosure:
+        """Builds the batch-averaged HVP closure z |-> H_avg z.
+
+        Expands the probe across the batch, contracts with grad_src = dL/d(src_graph),
+        differentiates w.r.t. ``target``, and sums over the batch:
+          (1/B) sum_b H_b z = H_avg z   (loss uses reduction='mean').
+
+        With (grad_src, src_graph, target) = (grad_fw, f_w, f_v) this is H_avg z;
+        with (grad_fv, f_v, f_w) it is the adjoint H_avg^T u.
+        """
+
+        def hvp(z: Tensor) -> Tensor:
+            z_batch = z.reshape(1, *src_graph.shape[1:]).expand_as(src_graph)
+            dot = (grad_src * z_batch).sum()
+            return torch.autograd.grad(dot, target, retain_graph=True)[0].sum(0)
+
+        return hvp
+
     def _power_iteration(
         self,
         f_v: Tensor,
@@ -197,34 +221,11 @@ class StochasticHessianEstimator:
         """
         assert grad_fv is not None
 
-        v = torch.randn(d_w, device=device)
-        v = v / v.norm()
-
-        for _ in range(self._n_power_iter):
-            # w = H_avg v  (v lives in the space of f_w)
-            # hvp[b] = (1/B) H_b v  (due to reduction='mean'), sum -> H_avg v
-            v_batch = v.reshape(1, *f_w_graph.shape[1:]).expand_as(f_w_graph)
-            dot = (grad_fw * v_batch).sum()
-            hvp = torch.autograd.grad(dot, f_v, retain_graph=True)[0]
-            w = hvp.sum(0)
-
-            # v_new = H_avg^T w  (w lives in the space of f_v)
-            w_batch = w.reshape(1, *f_v.shape[1:]).expand_as(f_v)
-            dot2 = (grad_fv * w_batch).sum()
-            htvp = torch.autograd.grad(dot2, f_w_graph, retain_graph=True)[0]
-            v_new = htvp.sum(0)
-
-            v_norm = v_new.norm()
-            if v_norm < 1e-12:
-                return 0.0  # sigma_1^2 = 0 - zero matrix, D is handled above
-            v = v_new / v_norm
-
-        # Final estimate sigma_1 = ||H_avg v||
-        v_batch = v.reshape(1, *f_w_graph.shape[1:]).expand_as(f_w_graph)
-        dot = (grad_fw * v_batch).sum()
-        hvp = torch.autograd.grad(dot, f_v, retain_graph=True)[0]
-        Hv = hvp.sum(0)
-        return (Hv**2).sum().item()
+        hvp = self._hvp_closure(grad_fw, f_w_graph, f_v)  # H_avg z   (f_w -> f_v)
+        hvp_adj = self._hvp_closure(grad_fv, f_v, f_w_graph)  # H_avg^T u (f_v -> f_w)
+        return power_iteration_spectral_sq(
+            hvp, hvp_adj, d_w, self._n_power_iter, device
+        )
 
     def _hutchinson_shared(
         self,
@@ -240,16 +241,8 @@ class StochasticHessianEstimator:
         Returns:
             Estimate of ||H_avg||_F^2.
         """
-        frob_sq = 0.0
-        for _ in range(self._n_probes):
-            z = torch.randint(0, 2, (d_w,), device=device).float() * 2 - 1
-            z_batch = z.reshape(1, *f_w_graph.shape[1:]).expand_as(f_w_graph)
-            dot = (grad_fw * z_batch).sum()
-            hvp = torch.autograd.grad(dot, f_v, retain_graph=True)[0]
-            # hvp[b] = (1/B) H_b z, sum -> (1/B) sum_b H_b z = H_avg z
-            Hz = hvp.sum(0)
-            frob_sq += (Hz**2).sum().item()
-        return frob_sq / self._n_probes
+        hvp = self._hvp_closure(grad_fw, f_w_graph, f_v)
+        return hutchinson_frob_sq(hvp, d_w, self._n_probes, device)
 
     # ------------------------------------------------------------------
     # Combined estimator (avoids double graph setup / Hutchinson)

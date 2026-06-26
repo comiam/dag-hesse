@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -12,6 +15,25 @@ from torch.utils.data import DataLoader
 from .config import TrainingConfig
 
 
+@dataclass(frozen=True)
+class StepCtx:
+    """Per-optimization-step context passed to a `Trainer` step hook.
+
+    A step hook receives the live model and the current (device-resident) minibatch and
+    *owns the parameter update* for that step, replacing the built-in optimizer.step().
+    This is the seam through which a second-order scheme such as COUPLE-FAC plugs in: it
+    rebuilds the curvature bundle on (x, y), refreshes its K-FAC provider, and applies
+    its own accepted direction. `step` is the global minibatch counter, used to amortize
+    periodic work (e.g. re-measuring coupling every T steps).
+    """
+
+    model: nn.Module
+    x: Tensor
+    y: Tensor
+    step: int
+    device: torch.device
+
+
 class Trainer:
     """Trains a model and saves state_dict at specified epochs."""
 
@@ -20,31 +42,43 @@ class Trainer:
         model: nn.Module,
         config: TrainingConfig,
         device: torch.device,
+        *,
+        optimizer: torch.optim.Optimizer | None = None,
+        step_hook: Callable[[StepCtx], None] | None = None,
     ) -> None:
         self._model = model.to(device)
         self._config = config
         self._device = device
         self._loss_fn = nn.CrossEntropyLoss()
+        self._step_hook = step_hook
+        self._step = 0
 
-        optimizer: torch.optim.SGD | torch.optim.Adam
-        if config.optimizer == "sgd":
-            optimizer = torch.optim.SGD(
-                model.parameters(),
-                lr=config.lr,
-                momentum=config.momentum,
-                weight_decay=config.weight_decay,
-            )
+        # Optimizer policy (open for extension): an injected optimizer wins; otherwise
+        # build the configured SGD/Adam - unless a step hook owns the update, in which
+        # case no built-in optimizer is needed.
+        self._optimizer: torch.optim.Optimizer | None
+        if optimizer is not None:
+            self._optimizer = optimizer
+        elif step_hook is None:
+            if config.optimizer == "sgd":
+                self._optimizer = torch.optim.SGD(
+                    model.parameters(),
+                    lr=config.lr,
+                    momentum=config.momentum,
+                    weight_decay=config.weight_decay,
+                )
+            else:
+                self._optimizer = torch.optim.Adam(
+                    model.parameters(),
+                    lr=config.lr,
+                    weight_decay=config.weight_decay,
+                )
         else:
-            optimizer = torch.optim.Adam(
-                model.parameters(),
-                lr=config.lr,
-                weight_decay=config.weight_decay,
-            )
-        self._optimizer = optimizer
+            self._optimizer = None
 
         self._scheduler = None
-        if config.scheduler == "cosine":
-            self._scheduler = CosineAnnealingLR(optimizer, T_max=config.epochs)
+        if self._optimizer is not None and config.scheduler == "cosine":
+            self._scheduler = CosineAnnealingLR(self._optimizer, T_max=config.epochs)
 
     @property
     def loss_fn(self) -> nn.Module:
@@ -54,11 +88,17 @@ class Trainer:
         self,
         train_loader: DataLoader,
         checkpoint_epochs: list[int] | None = None,
+        *,
+        on_epoch_end: Callable[[int], None] | None = None,
     ) -> dict[int, dict[str, Tensor]]:
         """Trains the model, returns {epoch: state_dict} for the requested epochs.
 
         checkpoint_epochs: list of epoch numbers at which to save state_dict.
             Default: [0 (init), epochs//2 (mid), epochs-1 (final)].
+        on_epoch_end: optional callback invoked with the 1-indexed epoch number after
+            each epoch (post scheduler step). Lets a caller record a per-epoch metric -
+            e.g. the validation-accuracy curve behind a speed-to-target measurement -
+            without materializing a weight snapshot every epoch.
         """
         epochs = self._config.epochs
         if checkpoint_epochs is None:
@@ -78,6 +118,8 @@ class Trainer:
             ep_num = epoch + 1  # 1-indexed for compatibility
             if ep_num in checkpoint_epochs:
                 checkpoints[ep_num] = self._snapshot()
+            if on_epoch_end is not None:
+                on_epoch_end(ep_num)
 
         # Final
         if epochs in checkpoint_epochs and epochs not in checkpoints:
@@ -114,14 +156,28 @@ class Trainer:
         n = 0
         for x, y in loader:
             x, y = x.to(self._device), y.to(self._device)
-            self._optimizer.zero_grad()
-            logits = self._model(x)
-            loss = self._loss_fn(logits, y)
-            loss.backward()
-            clip_grad_norm_(self._model.parameters(), max_norm=1.0)
-            self._optimizer.step()
-            total_loss += loss.item() * x.size(0)
-            n += x.size(0)
+            if self._step_hook is not None:
+                # The hook owns this step's forward/backward and parameter update.
+                self._step_hook(
+                    StepCtx(
+                        model=self._model,
+                        x=x,
+                        y=y,
+                        step=self._step,
+                        device=self._device,
+                    )
+                )
+            else:
+                assert self._optimizer is not None
+                self._optimizer.zero_grad()
+                logits = self._model(x)
+                loss = self._loss_fn(logits, y)
+                loss.backward()
+                clip_grad_norm_(self._model.parameters(), max_norm=1.0)
+                self._optimizer.step()
+                total_loss += loss.item() * x.size(0)
+                n += x.size(0)
+            self._step += 1
         return total_loss / max(n, 1)
 
     def _snapshot(self) -> dict[str, Tensor]:

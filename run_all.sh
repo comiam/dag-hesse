@@ -22,6 +22,7 @@ ALL_EXPS=(
 	exp4
 	exp5
 	exp6
+	exp7
 )
 
 declare -A EXP_CMD
@@ -155,6 +156,13 @@ EXP_CMD[exp6]="python main.py exp6 \
     --hessian-batch-size 32 \
     --output-dir results/exp6"
 EXP_DESC[exp6]="ResNet-18 conv: GN-Gap + R/C/D decay (CIFAR-10, stochastic)"
+
+# --- Exp7: COUPLE-FAC overlay repair (downloads Stanford Cars, full ResNet-50 finetune) ---
+
+EXP_CMD[exp7]="python main.py exp7 \
+    --profile b1 \
+    --output-dir results/exp7"
+EXP_DESC[exp7]="COUPLE-FAC overlay finetune on Stanford Cars (repair, B1 headline)"
 
 # ======================================================================
 # GPU detection

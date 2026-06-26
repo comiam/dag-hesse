@@ -28,7 +28,7 @@ import torch.nn.functional as F
 import torchvision.models as tv_models
 from torch import Tensor
 from torch.nn.utils.parametrizations import spectral_norm as _spectral_norm
-from torchvision.models.resnet import BasicBlock
+from torchvision.models.resnet import BasicBlock, ResNet
 
 _ACTIVATION_MAP = {
     "relu": nn.ReLU,
@@ -455,10 +455,14 @@ class SegmentedResNet18(nn.Module):
         activation: str = "relu",
     ) -> None:
         super().__init__()
-        self._base = tv_models.resnet18(num_classes=num_classes)
+        self._base = self._make_base(num_classes)
         self._activation = activation
         if activation != "relu":
             self._replace_activations(activation)
+
+    def _make_base(self, num_classes: int) -> ResNet:
+        """Build the wrapped torchvision backbone (overridden for other depths)."""
+        return tv_models.resnet18(num_classes=num_classes)
 
     def _replace_activations(self, activation: str) -> None:
         """Replaces all ReLU activations in the base model with the specified activation."""
@@ -507,6 +511,26 @@ class SegmentedResNet18(nn.Module):
         segs.append(seg5)
         return segs
 
+    def get_param_groups(self) -> dict[str, list[nn.Parameter]]:
+        """Trainable parameters grouped by measurement segment.
+
+        One group per `get_segments` measurement point - stem (conv1 + bn1), each of
+        layer1-4, and the classifier head - in segment (group-major) order. This is the
+        partition the parameter-space estimator (`ParamBlockEstimator`) and a K-FAC
+        provider consume, so a block-diagonal preconditioner's blocks line up with the
+        activation measurement points. BatchNorm parameters travel with their segment;
+        a K-FAC backend that does not factor them falls back to an identity block.
+        """
+        b = self._base
+        return {
+            "stem": list(b.conv1.parameters()) + list(b.bn1.parameters()),
+            "layer1": list(b.layer1.parameters()),
+            "layer2": list(b.layer2.parameters()),
+            "layer3": list(b.layer3.parameters()),
+            "layer4": list(b.layer4.parameters()),
+            "head": list(b.fc.parameters()),
+        }
+
 
 class SegmentedPlainResNet18(SegmentedResNet18):
     """ResNet-18 without skip-connections (plain conv-bn-act chain).
@@ -523,6 +547,38 @@ class SegmentedPlainResNet18(SegmentedResNet18):
     ) -> None:
         super().__init__(num_classes=num_classes, activation=activation)
         _disable_shortcuts(self._base)
+
+
+class SegmentedResNet50(SegmentedResNet18):
+    """ResNet-50 sharing SegmentedResNet18's torchvision-ResNet segmentation contract.
+
+    Same six segments / five measurement points (stem, layer1-4, head); only the
+    backbone depth (Bottleneck blocks, 4x channel expansion) and optional ImageNet
+    pretraining differ. On the standard 224x224 input the segment outputs are
+      stem (64,56,56) -> layer1 (256,56,56) -> layer2 (512,28,28)
+      -> layer3 (1024,14,14) -> layer4 (2048,7,7) -> head (num_classes,).
+
+    Primary use is Stage-B B1 (fine-grained full finetune): ``pretrained=True`` loads
+    IMAGENET1K_V2 weights and swaps the 1000-way classifier for a fresh ``num_classes``
+    head.
+    """
+
+    def __init__(
+        self,
+        num_classes: int = 196,
+        *,
+        pretrained: bool = True,
+        activation: str = "relu",
+    ) -> None:
+        self._pretrained = pretrained
+        super().__init__(num_classes=num_classes, activation=activation)
+
+    def _make_base(self, num_classes: int) -> ResNet:
+        if self._pretrained:
+            base = tv_models.resnet50(weights=tv_models.ResNet50_Weights.IMAGENET1K_V2)
+            base.fc = nn.Linear(base.fc.in_features, num_classes)
+            return base
+        return tv_models.resnet50(num_classes=num_classes)
 
 
 # ======================================================================

@@ -26,6 +26,9 @@ dependencies = [
     "matplotlib>=3.7",
     "torchvision>=0.15",
     "scipy>=1.10",
+    "curvlinops-for-pytorch>=3.0",
+    "kagglehub>=1.0.2",
+    "pillow>=12.2.0",
 ]
 
 [project.urls]
@@ -64,7 +67,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["hessian", "experiments", "paper_data"]
+known-first-party = ["hessian", "experiments", "paper_data", "secondorder"]
 
 [tool.mypy]
 python_version = "3.10"
@@ -84,6 +87,7 @@ module = [
     "numpy.*",
     "matplotlib.*",
     "scipy.*",
+    "curvlinops.*",
 ]
 ignore_missing_imports = true
 
