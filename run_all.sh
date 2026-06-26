@@ -23,6 +23,7 @@ ALL_EXPS=(
 	exp5
 	exp6
 	exp7
+	exp8
 )
 
 declare -A EXP_CMD
@@ -163,6 +164,13 @@ EXP_CMD[exp7]="python main.py exp7 \
     --profile b1 \
     --output-dir results/exp7"
 EXP_DESC[exp7]="COUPLE-FAC overlay finetune on Stanford Cars (repair, B1 headline)"
+
+# --- Exp8: Stage-A Phi diagnostic (CIFAR-100, ResNet-18 vs plain, from scratch) ---
+
+EXP_CMD[exp8]="python main.py exp8 \
+    --profile a1 \
+    --output-dir results/exp8"
+EXP_DESC[exp8]="Stage-A Phi blind-spot map: ResNet-18 vs plain on CIFAR-100 (A1 headline)"
 
 # ======================================================================
 # GPU detection

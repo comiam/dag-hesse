@@ -6,7 +6,7 @@ from .metrics import (
     compute_resonance,
     coupling_from_norms,
 )
-from .param_space import ParamBlockEstimator, ParamGroupedModel
+from .param_space import ParamBlockEstimator, ParamGroupedModel, PhiReport
 from .stochastic import StochasticHessianEstimator
 from .types import BlockHessianResult, GNGapResult, HessianBlock, LayerID
 
@@ -19,6 +19,7 @@ __all__ = [
     "StochasticHessianEstimator",
     "ParamBlockEstimator",
     "ParamGroupedModel",
+    "PhiReport",
     "ExactGNDecomposition",
     "StochasticGNGapEstimator",
     "compute_resonance",

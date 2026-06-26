@@ -84,6 +84,29 @@ class ParamCurvature:
     coupling: Callable[[], dict[tuple[LayerID, LayerID], float]]
 
 
+@dataclass(frozen=True)
+class PhiReport:
+    """Stage-A blind-spot diagnostic for one minibatch: Phi and where its mass sits.
+
+    The three members come from the single backward graph g = grad_theta L the estimator
+    builds, so they are mutually consistent and share the Hutchinson probe cost (the
+    measurement counterpart of `ParamCurvature`, which exposes the same machinery for an
+    optimization step):
+
+      - ``phi``: the discarded-coupling fraction Phi in [0, 1) - the share of total
+        curvature mass any block-diagonal preconditioner throws away (NaN if
+        ||H||_F^2 ~ 0);
+      - ``diag_frob``: per-block ||H_{theta_v, theta_v}||_F, locating the diagonal mass
+        K-FAC *keeps*, in group-major order;
+      - ``coupling``: C(v, w) for every pair v before w in group order, locating the
+        off-diagonal mass it *discards* (the residual-merge / conv-BN hotspots).
+    """
+
+    phi: float
+    diag_frob: dict[LayerID, float]
+    coupling: dict[tuple[LayerID, LayerID], float]
+
+
 @dataclass
 class _ParamGraph:
     """A single backward graph g = grad_theta L, grouped by parameter block.
@@ -161,6 +184,31 @@ class ParamBlockEstimator:
             return math.nan
         diag_sq = sum(self._block_frob_sq(graph, name, name) for name in graph.names)
         return 1.0 - diag_sq / full_sq
+
+    def estimate_phi_report(self, x: Tensor, y: Tensor) -> PhiReport:
+        """Phi plus its diagonal-mass and coupling localization, from one backward graph.
+
+        The Stage-A diagnostic bundle (Delta-M1/M2): one full-parameter probe set gives
+        ||H||_F^2 and one group-localized set per block gives every diagonal norm, hence
+        Phi; the off-diagonal norms then give the coupling field C(v, w). Each diagonal
+        block is measured once and reused for both Phi and the couplings that contain it
+        - the same single-graph amortization as `curvature`'s deferred ``coupling``,
+        exposed here for measurement rather than for a step.
+        """
+        graph = self._grad_graph(x, y)
+        full_sq = self._full_frob_sq(graph)
+        diag_sq = {v: self._block_frob_sq(graph, v, v) for v in graph.names}
+        phi = math.nan if full_sq < _EPS else 1.0 - sum(diag_sq.values()) / full_sq
+        diag_frob = {v: s**0.5 for v, s in diag_sq.items()}
+
+        coupling: dict[tuple[LayerID, LayerID], float] = {}
+        names = graph.names
+        for i, v in enumerate(names):
+            for w in names[i + 1 :]:
+                r_vw = self._block_frob_sq(graph, v, w) ** 0.5
+                coupling[(v, w)] = coupling_from_norms(r_vw, diag_frob[v], diag_frob[w])
+
+        return PhiReport(phi=phi, diag_frob=diag_frob, coupling=coupling)
 
     def estimate_coupling(
         self,

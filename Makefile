@@ -1,6 +1,6 @@
 .PHONY: help install lint format typecheck test check clean \
        experiments exp1 exp1b exp2 exp3 exp3_ln \
-       exp1_appendix exp2_unified exp3_appendix exp4 exp5 exp6 exp7
+       exp1_appendix exp2_unified exp3_appendix exp4 exp5 exp6 exp7 exp8
 
 GPU ?=
 
@@ -74,6 +74,8 @@ exp6: ## ResNet-18 conv GN-Gap + decay (stochastic)
 exp7: ## COUPLE-FAC overlay finetune on Stanford Cars (repair)
 	bash run_all.sh exp7 $(if $(GPU),--gpu $(GPU))
 
+exp8: ## Stage-A Phi blind-spot map: ResNet-18 vs plain on CIFAR-100
+	bash run_all.sh exp8 $(if $(GPU),--gpu $(GPU))
 # ---------------------------------------------------------------------------
 
 clean: ## Remove caches

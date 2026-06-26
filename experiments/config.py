@@ -275,3 +275,82 @@ class Exp7Config:
                 scheduler="cosine",
             ),
         )
+
+
+@dataclass
+class Exp8Config:
+    """Exp8: Stage-A Phi diagnostic - the K-FAC blind-spot map (the diagnosis experiment).
+
+    Measures the discarded-coupling fraction Phi (Delta-M1) and where its mass sits -
+    per-block diagonal norms ||H_{vv}||_F plus the coupling field C(v, w) (Delta-M2) -
+    on a real convolutional DAG, with NO change to training. It is the cheap diagnosis
+    that motivates the exp7 repair. The headline is the inversion Phi_ResNet >> Phi_Plain:
+    skip connections preserve inter-layer coupling, so a block-diagonal preconditioner
+    (K-FAC / EKFAC) discards more curvature on a ResNet than on its skip-free counterpart.
+
+    Two regimes share this schema ("Stage A" in the plan):
+      A1 (from scratch, the inversion headline) - `SegmentedResNet18` vs its skip-free
+        control `SegmentedPlainResNet18` on CIFAR-100, Phi tracked at init / mid / final;
+        see `a1_from_scratch`.
+      A2 (pretrained, source (P)) - an ImageNet-pretrained ResNet-50 measured pre-
+        finetune on Stanford Cars, where correlated pretrained Jacobians push Phi even
+        higher; measured init-only (no training); see `a2_pretrained`.
+    """
+
+    # Backbones (each exposes group-major `get_param_groups`) + data
+    archs: list[str] = field(default_factory=lambda: ["resnet18", "plain_resnet18"])
+    dataset: str = "cifar100"  # "cifar100" | "cifar10" | "stanford_cars"
+    num_classes: int = 100
+    pretrained: bool = False  # ImageNet init (A2); False for from-scratch (A1)
+    image_size: int = 32
+
+    # Phi estimation (Hutchinson on the parameter-space cross-block HVP)
+    n_probes: int = 30
+    hessian_batch_size: int = 32  # minibatch subsampled for the Hessian measurement
+
+    # Checkpoints at which Phi is measured (init = pre-training, then mid, final)
+    checkpoint_epochs: list[str] = field(
+        default_factory=lambda: ["init", "mid", "final"]
+    )
+    training: TrainingConfig = field(
+        default_factory=lambda: TrainingConfig(
+            lr=0.1,
+            batch_size=128,
+            epochs=30,
+            optimizer="sgd",
+            momentum=0.9,
+            weight_decay=5e-4,
+            scheduler="cosine",
+        )
+    )
+
+    @classmethod
+    def a1_from_scratch(cls) -> Exp8Config:
+        """A1 headline: ResNet-18 vs plain ResNet-18 from scratch on CIFAR-100."""
+        return cls()
+
+    @classmethod
+    def a2_pretrained(cls) -> Exp8Config:
+        """A2: ImageNet-pretrained ResNet-50, Phi measured pre-finetune on Stanford Cars.
+
+        Diagnostic only - no training (epochs = 0 => Phi is read off the freshly loaded
+        pretrained weights, at the single ``init`` checkpoint), isolating source (P):
+        correlated pretrained Jacobians inflate the off-diagonal mass before any update.
+        """
+        return cls(
+            archs=["resnet50"],
+            dataset="stanford_cars",
+            num_classes=196,
+            pretrained=True,
+            image_size=224,
+            checkpoint_epochs=["init"],
+            training=TrainingConfig(
+                lr=0.01,
+                batch_size=64,
+                epochs=0,
+                optimizer="sgd",
+                momentum=0.9,
+                weight_decay=1e-4,
+                scheduler="none",
+            ),
+        )

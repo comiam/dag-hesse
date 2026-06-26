@@ -261,6 +261,64 @@ def test_curvature_coupling_matches_exact() -> None:
 
 
 # ------------------------------------------------------------------
+# 5. Phi report bundle (Phi + diagonal norms + coupling field) vs exact
+# ------------------------------------------------------------------
+
+
+def test_phi_report_matches_exact() -> None:
+    device = torch.device("cpu")
+    torch.manual_seed(5)
+
+    model = _TinyGroupedMLP().to(device)
+    model.eval()
+    loss_fn = nn.CrossEntropyLoss()
+    x, y = _make_data(device=device)
+
+    hess, ranges = _exact_param_hessian(model, loss_fn, x, y)
+    names = list(model.get_param_groups().keys())
+    expected_pairs = [(v, w) for i, v in enumerate(names) for w in names[i + 1 :]]
+
+    est = ParamBlockEstimator(model, loss_fn, n_probes=8000)
+    report = est.estimate_phi_report(x, y)
+
+    # (a) scalar Phi consistent with the dedicated estimator and the exact Hessian
+    phi_exact = _exact_phi(hess, ranges, names)
+    assert (
+        abs(phi_exact - report.phi) < 0.04
+    ), f"Phi mismatch: exact={phi_exact:.4f} report={report.phi:.4f}"
+
+    # (b) diagonal norms: keys in group-major order, each within tolerance
+    assert (
+        list(report.diag_frob.keys()) == names
+    ), f"diag_frob order wrong: {list(report.diag_frob.keys())} != {names}"
+    for v in names:
+        exact = _block_frob(hess, ranges, v, v)
+        rel = abs(exact - report.diag_frob[v]) / (exact + 1e-12)
+        assert rel < 0.1, (
+            f"||H_{v},{v}||_F mismatch: exact={exact:.4f} "
+            f"report={report.diag_frob[v]:.4f} rel={rel:.3f}"
+        )
+
+    # (c) coupling field: same pairs/order as `curvature`, each within tolerance
+    assert (
+        list(report.coupling.keys()) == expected_pairs
+    ), f"coupling pairs/order wrong: {list(report.coupling.keys())} != {expected_pairs}"
+    for v, w in expected_pairs:
+        r_vv = _block_frob(hess, ranges, v, v)
+        r_ww = _block_frob(hess, ranges, w, w)
+        c_exact = _block_frob(hess, ranges, v, w) / (r_vv * r_ww) ** 0.5
+        rel = abs(c_exact - report.coupling[(v, w)]) / (c_exact + 1e-12)
+        assert rel < 0.12, (
+            f"C({v},{w}) mismatch: exact={c_exact:.4f} "
+            f"report={report.coupling[(v, w)]:.4f} rel={rel:.3f}"
+        )
+    print(
+        f"  Phi report: phi={report.phi:.4f} "
+        f"({len(report.diag_frob)} blocks, {len(report.coupling)} pairs) - OK"
+    )
+
+
+# ------------------------------------------------------------------
 
 if __name__ == "__main__":
     print("test_cross_block_frob_vs_exact...")
@@ -277,5 +335,8 @@ if __name__ == "__main__":
 
     print("test_curvature_coupling_matches_exact...")
     test_curvature_coupling_matches_exact()
+
+    print("test_phi_report_matches_exact...")
+    test_phi_report_matches_exact()
 
     print("\nAll tests passed.")

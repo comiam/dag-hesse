@@ -110,6 +110,64 @@ def get_cifar10_image_loaders(
     return train_loader, val_loader
 
 
+# CIFAR-100 with proper augmentation (for convolutional models)
+_CIFAR100_MEAN = (0.5071, 0.4865, 0.4409)
+_CIFAR100_STD = (0.2673, 0.2564, 0.2762)
+
+
+def get_cifar100_image_loaders(
+    batch_size: int,
+    data_root: str = "./data",
+) -> tuple[DataLoader, DataLoader]:
+    """Returns (train_loader, val_loader) for CIFAR-100 with augmentation.
+
+    The CIFAR-100 counterpart of `get_cifar10_image_loaders` (same conv-friendly
+    pipeline, CIFAR-100 normalization): train uses RandomCrop(32, padding=4) +
+    RandomHorizontalFlip + per-channel normalization; val uses normalization only.
+    """
+    train_transform = T.Compose(
+        [
+            T.RandomCrop(32, padding=4),
+            T.RandomHorizontalFlip(),
+            T.ToTensor(),
+            T.Normalize(_CIFAR100_MEAN, _CIFAR100_STD),
+        ]
+    )
+    val_transform = T.Compose(
+        [
+            T.ToTensor(),
+            T.Normalize(_CIFAR100_MEAN, _CIFAR100_STD),
+        ]
+    )
+    train_ds = torchvision.datasets.CIFAR100(
+        data_root,
+        train=True,
+        download=True,
+        transform=train_transform,
+    )
+    val_ds = torchvision.datasets.CIFAR100(
+        data_root,
+        train=False,
+        download=True,
+        transform=val_transform,
+    )
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True,
+    )
+    return train_loader, val_loader
+
+
 # Stanford Cars (fine-grained, 196 classes) - Stage-B B1 finetune
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _IMAGENET_STD = (0.229, 0.224, 0.225)

@@ -8,6 +8,7 @@ Subcommands:
   exp5  - Toy-Attention vs ReLU-MLP: verification of H^T_{Q,K} != 0.
   exp6  - ResNet-18 conv: GN-Gap and R/C decay in a convolutional DAG.
   exp7  - COUPLE-FAC overlay optimization (K-FAC + coupling-gated correction).
+  exp8  - Stage-A Phi diagnostic: the K-FAC blind-spot map (Phi_ResNet >> Phi_Plain).
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ from experiments.config import (
     Exp5Config,
     Exp6Config,
     Exp7Config,
+    Exp8Config,
     HessianConfig,
     TrainingConfig,
 )
@@ -60,6 +62,7 @@ from experiments.runner_exp4 import Exp4Runner
 from experiments.runner_exp5 import Exp5Runner
 from experiments.runner_exp6 import Exp6Runner
 from experiments.runner_exp7 import Exp7Runner
+from experiments.runner_exp8 import Exp8Runner
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -615,9 +618,9 @@ def _run_exp6(args: argparse.Namespace) -> None:
 # Exp7: COUPLE-FAC overlay optimization (the repair experiment)
 # ======================================================================
 
-# Class count per exp7 dataset; keeps the backbone head consistent when
-# --dataset overrides the profile default.
-_EXP7_NUM_CLASSES = {
+# Class count per dataset; keeps the backbone head consistent when --dataset
+# overrides a profile default (shared by exp7 and exp8).
+_DATASET_NUM_CLASSES = {
     "stanford_cars": 196,
     "cifar10": 10,
     "cifar100": 100,
@@ -694,7 +697,7 @@ def _make_exp7_config(args: argparse.Namespace) -> Exp7Config:
     }
     # A dataset switch implies its class count (keeps the head consistent).
     if "dataset" in overrides:
-        overrides["num_classes"] = _EXP7_NUM_CLASSES[overrides["dataset"]]
+        overrides["num_classes"] = _DATASET_NUM_CLASSES[overrides["dataset"]]
 
     return replace(base, training=training, **overrides)
 
@@ -710,6 +713,93 @@ def _run_exp7(args: argparse.Namespace) -> None:
     out_dir = Path(args.output_dir or f"results/exp7_{args.profile}")
     _save_results(results, out_dir)
     logger.info("Exp7 done. Results in %s", out_dir)
+
+
+# ======================================================================
+# exp8: Stage-A Phi diagnostic
+# ======================================================================
+
+
+def _add_exp8_args(parser: argparse.ArgumentParser) -> None:
+    _add_device_args(parser)
+    parser.add_argument(
+        "--profile",
+        type=str,
+        default="a1",
+        choices=["a1", "a2"],
+        help="a1: ResNet-18 vs plain ResNet-18 from scratch on CIFAR-100 (the inversion "
+        "headline Phi_ResNet >> Phi_Plain); a2: ImageNet-pretrained ResNet-50, Phi "
+        "measured pre-finetune on Stanford Cars.",
+    )
+    # Optional overrides; a value of None leaves the profile default untouched.
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        choices=["cifar100", "cifar10", "stanford_cars"],
+    )
+    parser.add_argument(
+        "--archs",
+        type=str,
+        nargs="+",
+        default=None,
+        choices=["resnet18", "plain_resnet18", "resnet50"],
+    )
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--seeds", type=int, nargs="+", default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--n-probes", type=int, default=None)
+    parser.add_argument("--hessian-batch-size", type=int, default=None)
+
+
+def _make_exp8_config(args: argparse.Namespace) -> Exp8Config:
+    """Selects the regime profile, then applies any explicit CLI overrides."""
+    if args.profile == "a1":
+        base = Exp8Config.a1_from_scratch()
+    else:
+        base = Exp8Config.a2_pretrained()
+
+    training = replace(
+        base.training,
+        **{
+            key: value
+            for key, value in {
+                "epochs": args.epochs,
+                "seeds": args.seeds,
+                "batch_size": args.batch_size,
+            }.items()
+            if value is not None
+        },
+    )
+
+    overrides: dict[str, Any] = {
+        key: value
+        for key, value in {
+            "dataset": args.dataset,
+            "archs": args.archs,
+            "n_probes": args.n_probes,
+            "hessian_batch_size": args.hessian_batch_size,
+        }.items()
+        if value is not None
+    }
+    # A dataset switch implies its class count (keeps the head consistent).
+    if "dataset" in overrides:
+        overrides["num_classes"] = _DATASET_NUM_CLASSES[overrides["dataset"]]
+
+    return replace(base, training=training, **overrides)
+
+
+def _run_exp8(args: argparse.Namespace) -> None:
+    device = _resolve_device(args)
+    logger.info("Device: %s", device)
+
+    config = _make_exp8_config(args)
+    runner = Exp8Runner(config, device)
+    results = runner.run()
+
+    out_dir = Path(args.output_dir or f"results/exp8_{args.profile}")
+    _save_results(results, out_dir)
+    logger.info("Exp8 done. Results in %s", out_dir)
 
 
 # ======================================================================
@@ -768,6 +858,13 @@ def main() -> None:
     )
     _add_exp7_args(p7)
 
+    # exp8
+    p8 = subparsers.add_parser(
+        "exp8",
+        help="Stage-A Phi diagnostic (K-FAC blind-spot map: Phi_ResNet >> Phi_Plain)",
+    )
+    _add_exp8_args(p8)
+
     args = parser.parse_args()
 
     dispatch = {
@@ -779,6 +876,7 @@ def main() -> None:
         "exp5": _run_exp5,
         "exp6": _run_exp6,
         "exp7": _run_exp7,
+        "exp8": _run_exp8,
     }
     dispatch[args.experiment](args)
 
