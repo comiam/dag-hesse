@@ -123,10 +123,9 @@ class StochasticHessianEstimator:
         f_v, f_w_graph, grad_fw, _ = self._setup_graph(x, y, layer_v, layer_w)
 
         device = f_v.device
-        B = f_v.shape[0]
         d_w = f_w_graph[0].numel()  # C*H*W for 4D, d for 2D
 
-        frob_sq = self._hutchinson_shared(f_v, f_w_graph, grad_fw, B, d_w, device)
+        frob_sq = self._hutchinson_shared(f_v, f_w_graph, grad_fw, d_w, device)
         return frob_sq**0.5
 
     # ------------------------------------------------------------------
@@ -154,7 +153,6 @@ class StochasticHessianEstimator:
         )
 
         device = f_v.device
-        B = f_v.shape[0]
         d_w = f_w_graph[0].numel()  # C*H*W for 4D, d for 2D
 
         # --- ||H||_2 via power iteration ---
@@ -163,7 +161,6 @@ class StochasticHessianEstimator:
             f_w_graph,
             grad_fw,
             grad_fv,
-            B,
             d_w,
             device,
         )
@@ -174,7 +171,6 @@ class StochasticHessianEstimator:
             f_v,
             f_w_graph,
             grad_fw,
-            B,
             d_w,
             device,
         )
@@ -210,7 +206,6 @@ class StochasticHessianEstimator:
         f_w_graph: Tensor,
         grad_fw: Tensor,
         grad_fv: Tensor | None,
-        B: int,
         d_w: int,
         device: torch.device,
     ) -> float:
@@ -232,7 +227,6 @@ class StochasticHessianEstimator:
         f_v: Tensor,
         f_w_graph: Tensor,
         grad_fw: Tensor,
-        B: int,
         d_w: int,
         device: torch.device,
     ) -> float:
@@ -268,10 +262,9 @@ class StochasticHessianEstimator:
         )
 
         device = f_v.device
-        B = f_v.shape[0]
         d_w = f_w_graph[0].numel()  # C*H*W for 4D, d for 2D
 
-        frob_sq = self._hutchinson_shared(f_v, f_w_graph, grad_fw, B, d_w, device)
+        frob_sq = self._hutchinson_shared(f_v, f_w_graph, grad_fw, d_w, device)
         frob_norm = frob_sq**0.5
 
         spectral_sq = self._power_iteration(
@@ -279,7 +272,6 @@ class StochasticHessianEstimator:
             f_w_graph,
             grad_fw,
             grad_fv,
-            B,
             d_w,
             device,
         )

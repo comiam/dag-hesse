@@ -9,6 +9,7 @@ Subcommands:
   exp6  - ResNet-18 conv: GN-Gap and R/C decay in a convolutional DAG.
   exp7  - COUPLE-FAC overlay optimization (K-FAC + coupling-gated correction).
   exp8  - Stage-A Phi diagnostic: the K-FAC blind-spot map (Phi_ResNet >> Phi_Plain).
+  exp9  - Stage-A Phi ladder on frozen transformers (toy sizes; on-demand Qwen/Llama).
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ from experiments.config import (
     Exp6Config,
     Exp7Config,
     Exp8Config,
+    Exp9Config,
     HessianConfig,
     TrainingConfig,
 )
@@ -63,6 +65,7 @@ from experiments.runner_exp5 import Exp5Runner
 from experiments.runner_exp6 import Exp6Runner
 from experiments.runner_exp7 import Exp7Runner
 from experiments.runner_exp8 import Exp8Runner
+from experiments.runner_exp9 import Exp9Runner
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -624,7 +627,7 @@ _DATASET_NUM_CLASSES = {
     "stanford_cars": 196,
     "cifar10": 10,
     "cifar100": 100,
-    "imagenet32": 1000,
+    "imagenet32": 1001,  # HF mirror keeps the index-0 background class
 }
 
 
@@ -726,24 +729,33 @@ def _add_exp8_args(parser: argparse.ArgumentParser) -> None:
         "--profile",
         type=str,
         default="a1",
-        choices=["a1", "a2"],
+        choices=["a1", "a1_width", "a1_imagenet32", "a2"],
         help="a1: ResNet-18 vs plain ResNet-18 from scratch on CIFAR-100 (the inversion "
-        "headline Phi_ResNet >> Phi_Plain); a2: ImageNet-pretrained ResNet-50, Phi "
-        "measured pre-finetune on Stanford Cars.",
+        "headline Phi_ResNet >> Phi_Plain); a1_width: the width/depth axis (ResNet-18 at "
+        "0.5x/1x/2x width + ResNet-34, on-demand); a1_imagenet32: the a1 inversion on "
+        "downsampled ImageNet-32 (on-demand, Hugging Face); a2: ImageNet-pretrained "
+        "ResNet-50, Phi measured pre-finetune on Stanford Cars.",
     )
     # Optional overrides; a value of None leaves the profile default untouched.
     parser.add_argument(
         "--dataset",
         type=str,
         default=None,
-        choices=["cifar100", "cifar10", "stanford_cars"],
+        choices=["cifar100", "cifar10", "imagenet32", "stanford_cars"],
     )
     parser.add_argument(
         "--archs",
         type=str,
         nargs="+",
         default=None,
-        choices=["resnet18", "plain_resnet18", "resnet50"],
+        choices=[
+            "resnet18",
+            "resnet18_w0.5",
+            "resnet18_w2.0",
+            "resnet34",
+            "plain_resnet18",
+            "resnet50",
+        ],
     )
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--seeds", type=int, nargs="+", default=None)
@@ -756,6 +768,10 @@ def _make_exp8_config(args: argparse.Namespace) -> Exp8Config:
     """Selects the regime profile, then applies any explicit CLI overrides."""
     if args.profile == "a1":
         base = Exp8Config.a1_from_scratch()
+    elif args.profile == "a1_width":
+        base = Exp8Config.a1_width()
+    elif args.profile == "a1_imagenet32":
+        base = Exp8Config.a1_imagenet32()
     else:
         base = Exp8Config.a2_pretrained()
 
@@ -800,6 +816,87 @@ def _run_exp8(args: argparse.Namespace) -> None:
     out_dir = Path(args.output_dir or f"results/exp8_{args.profile}")
     _save_results(results, out_dir)
     logger.info("Exp8 done. Results in %s", out_dir)
+
+
+# ======================================================================
+# exp9: Stage-A Phi ladder on frozen transformers
+# ======================================================================
+
+
+def _add_exp9_args(parser: argparse.ArgumentParser) -> None:
+    _add_device_args(parser)
+    parser.add_argument(
+        "--profile",
+        type=str,
+        default="a3_toy",
+        choices=["a3_toy", "a3_llm"],
+        help="a3_toy: local toy-decoder size ladder (default sweep, no extra deps); "
+        "a3_llm: on-demand frozen Hugging Face LM ladder (Qwen2.5 + Llama-3.1, bf16, "
+        "needs the optional transformers dependency).",
+    )
+    # Optional overrides; a value of None leaves the profile default untouched.
+    parser.add_argument(
+        "--models",
+        type=str,
+        nargs="+",
+        default=None,
+        help="toy presets (tiny/small/base) or Hugging Face model ids",
+    )
+    parser.add_argument("--seq-len", type=int, default=None)
+    parser.add_argument("--n-probes", type=int, default=None)
+    parser.add_argument("--hessian-batch-size", type=int, default=None)
+    parser.add_argument("--seeds", type=int, nargs="+", default=None)
+    parser.add_argument(
+        "--dtype", type=str, default=None, choices=["float32", "bfloat16"]
+    )
+    parser.add_argument(
+        "--attn-granularity", type=str, default=None, choices=["qkv", "block"]
+    )
+    parser.add_argument(
+        "--coupling-band",
+        type=int,
+        default=None,
+        help="limit the coupling field to block pairs within this many blocks (plus all "
+        "intra-layer pairs); omit for the profile default (full for toy, banded for the "
+        "on-demand LLM ladder).",
+    )
+
+
+def _make_exp9_config(args: argparse.Namespace) -> Exp9Config:
+    """Selects the regime profile, then applies any explicit CLI overrides."""
+    if args.profile == "a3_toy":
+        base = Exp9Config.a3_toy()
+    else:
+        base = Exp9Config.a3_llm()
+
+    overrides: dict[str, Any] = {
+        key: value
+        for key, value in {
+            "models": args.models,
+            "seq_len": args.seq_len,
+            "n_probes": args.n_probes,
+            "hessian_batch_size": args.hessian_batch_size,
+            "seeds": args.seeds,
+            "dtype": args.dtype,
+            "attn_granularity": args.attn_granularity,
+            "coupling_band": args.coupling_band,
+        }.items()
+        if value is not None
+    }
+    return replace(base, **overrides)
+
+
+def _run_exp9(args: argparse.Namespace) -> None:
+    device = _resolve_device(args)
+    logger.info("Device: %s", device)
+
+    config = _make_exp9_config(args)
+    runner = Exp9Runner(config, device)
+    results = runner.run()
+
+    out_dir = Path(args.output_dir or f"results/exp9_{args.profile}")
+    _save_results(results, out_dir)
+    logger.info("Exp9 done. Results in %s", out_dir)
 
 
 # ======================================================================
@@ -865,6 +962,13 @@ def main() -> None:
     )
     _add_exp8_args(p8)
 
+    # exp9
+    p9 = subparsers.add_parser(
+        "exp9",
+        help="Stage-A Phi ladder on frozen transformers (toy sizes / on-demand LLMs)",
+    )
+    _add_exp9_args(p9)
+
     args = parser.parse_args()
 
     dispatch = {
@@ -877,6 +981,7 @@ def main() -> None:
         "exp6": _run_exp6,
         "exp7": _run_exp7,
         "exp8": _run_exp8,
+        "exp9": _run_exp9,
     }
     dispatch[args.experiment](args)
 

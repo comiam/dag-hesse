@@ -150,10 +150,8 @@ class Trainer:
             "test_loss": total_loss / max(n, 1),
         }
 
-    def _train_epoch(self, loader: DataLoader) -> float:
+    def _train_epoch(self, loader: DataLoader) -> None:
         self._model.train()
-        total_loss = 0.0
-        n = 0
         for x, y in loader:
             x, y = x.to(self._device), y.to(self._device)
             if self._step_hook is not None:
@@ -175,10 +173,7 @@ class Trainer:
                 loss.backward()
                 clip_grad_norm_(self._model.parameters(), max_norm=1.0)
                 self._optimizer.step()
-                total_loss += loss.item() * x.size(0)
-                n += x.size(0)
             self._step += 1
-        return total_loss / max(n, 1)
 
     def _snapshot(self) -> dict[str, Tensor]:
         return {

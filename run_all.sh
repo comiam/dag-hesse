@@ -24,6 +24,7 @@ ALL_EXPS=(
 	exp6
 	exp7
 	exp8
+	exp9
 )
 
 declare -A EXP_CMD
@@ -171,6 +172,13 @@ EXP_CMD[exp8]="python main.py exp8 \
     --profile a1 \
     --output-dir results/exp8"
 EXP_DESC[exp8]="Stage-A Phi blind-spot map: ResNet-18 vs plain on CIFAR-100 (A1 headline)"
+
+# --- Exp9: Stage-A Phi ladder on frozen transformers (toy size sweep, no extra deps) ---
+
+EXP_CMD[exp9]="python main.py exp9 \
+    --profile a3_toy \
+    --output-dir results/exp9"
+EXP_DESC[exp9]="Stage-A Phi ladder on toy decoders (A3 toy; LLM ladder runs on demand)"
 
 # ======================================================================
 # GPU detection

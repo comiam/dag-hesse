@@ -42,15 +42,18 @@ from experiments.config import Exp8Config
 from experiments.data import (
     get_cifar10_image_loaders,
     get_cifar100_image_loaders,
+    get_imagenet32_loaders,
     get_stanford_cars_loaders,
 )
 from experiments.models import (
     SegmentedPlainResNet18,
     SegmentedResNet18,
+    SegmentedResNet34,
     SegmentedResNet50,
+    SegmentedWideResNet18,
 )
 from experiments.training import Trainer
-from experiments.utils import set_seed
+from experiments.utils import phi_report_to_dict, set_seed
 from hessian import ParamBlockEstimator, ParamGroupedModel
 
 logger = logging.getLogger(__name__)
@@ -75,6 +78,8 @@ def _build_loaders(cfg: Exp8Config) -> tuple[DataLoader, DataLoader]:
         return get_cifar100_image_loaders(batch_size)
     if cfg.dataset == "cifar10":
         return get_cifar10_image_loaders(batch_size)
+    if cfg.dataset == "imagenet32":
+        return get_imagenet32_loaders(batch_size)
     if cfg.dataset == "stanford_cars":
         return get_stanford_cars_loaders(
             batch_size,
@@ -86,16 +91,33 @@ def _build_loaders(cfg: Exp8Config) -> tuple[DataLoader, DataLoader]:
 
 
 def _build_model(cfg: Exp8Config, arch: str) -> SegmentedResNet18:
-    """Backbone for the registry key ``arch`` (all share the ResNet segmentation)."""
+    """Backbone for the registry key ``arch`` (all share the ResNet segmentation).
+
+    ``resnet18_w<m>`` is ResNet-18 with every stage width scaled by ``<m>`` (the width
+    axis). Only ``resnet50`` honours ``pretrained``; the from-scratch backbones reject it
+    rather than silently ignoring it.
+    """
+    if cfg.pretrained and arch != "resnet50":
+        raise ValueError(
+            f"pretrained=True is only supported for 'resnet50'; arch {arch!r} builds "
+            "from scratch (set pretrained=False)"
+        )
     if arch == "resnet50":
         return SegmentedResNet50(num_classes=cfg.num_classes, pretrained=cfg.pretrained)
-    if arch == "resnet18":
-        return SegmentedResNet18(num_classes=cfg.num_classes)
+    if arch == "resnet34":
+        return SegmentedResNet34(num_classes=cfg.num_classes)
     if arch == "plain_resnet18":
         return SegmentedPlainResNet18(num_classes=cfg.num_classes)
+    if arch == "resnet18":
+        return SegmentedResNet18(num_classes=cfg.num_classes)
+    if arch.startswith("resnet18_w"):
+        return SegmentedWideResNet18(
+            num_classes=cfg.num_classes,
+            width_mult=float(arch.removeprefix("resnet18_w")),
+        )
     raise ValueError(
-        f"unknown arch {arch!r}; expected "
-        "'resnet18', 'plain_resnet18', or 'resnet50'"
+        f"unknown arch {arch!r}; expected one of 'resnet18', 'resnet18_w<mult>', "
+        "'resnet34', 'plain_resnet18', 'resnet50'"
     )
 
 
@@ -130,17 +152,9 @@ def _measure_phi(
     loss_fn: nn.Module,
     n_probes: int,
 ) -> dict[str, Any]:
-    """JSON-safe Phi report on one minibatch: Phi, diagonal norms, coupling field.
-
-    Coupling keys are flattened to ``"v->w"`` strings so the bundle serializes directly.
-    """
+    """JSON-safe Phi report on one minibatch: Phi, diagonal norms, coupling field."""
     estimator = ParamBlockEstimator(model, loss_fn, n_probes=n_probes)
-    report = estimator.estimate_phi_report(x, y)
-    return {
-        "phi": report.phi,
-        "diag_frob": dict(report.diag_frob),
-        "coupling": {f"{v}->{w}": c for (v, w), c in report.coupling.items()},
-    }
+    return phi_report_to_dict(estimator.estimate_phi_report(x, y))
 
 
 # ======================================================================

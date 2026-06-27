@@ -185,11 +185,9 @@ class Exp5Runner:
         loader: DataLoader,
         loss_fn: nn.Module,
         optimizer: torch.optim.Optimizer,
-    ) -> float:
+    ) -> None:
         model.train()
         device = next(model.parameters()).device
-        total_loss = 0.0
-        n = 0
         for x, y in loader:
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad()
@@ -198,9 +196,6 @@ class Exp5Runner:
             loss.backward()
             clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            total_loss += loss.item() * x.size(0)
-            n += x.size(0)
-        return total_loss / max(n, 1)
 
     @staticmethod
     def _evaluate(

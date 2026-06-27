@@ -16,16 +16,23 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+from PIL import Image
 
 _ROOT = Path(__file__).resolve().parents[2]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from experiments.config import Exp8Config  # noqa: E402
+from experiments.data import (  # noqa: E402
+    _HFImageClassification,
+    _imagenet32_transforms,
+)
 from experiments.models import (  # noqa: E402
     SegmentedPlainResNet18,
     SegmentedResNet18,
+    SegmentedResNet34,
     SegmentedResNet50,
+    SegmentedWideResNet18,
 )
 from experiments.runner_exp8 import (  # noqa: E402
     _aggregate,
@@ -74,6 +81,31 @@ def test_build_model_dispatch() -> None:
     except ValueError:
         raised = True
     assert raised, "unknown arch must raise ValueError"
+
+
+def test_build_model_resnet34_and_width() -> None:
+    cfg = Exp8Config.a1_width()
+
+    m34 = _build_model(cfg, "resnet34")
+    assert isinstance(m34, SegmentedResNet34), "resnet34 key builds SegmentedResNet34"
+
+    m_half = _build_model(cfg, "resnet18_w0.5")
+    assert isinstance(
+        m_half, SegmentedWideResNet18
+    ), "width key builds the wide variant"
+    half = sum(p.numel() for p in m_half.parameters())
+    full = sum(p.numel() for p in _build_model(cfg, "resnet18").parameters())
+    assert half < full, "0.5x width must have fewer parameters than 1x"
+
+
+def test_build_model_pretrained_guard() -> None:
+    cfg = Exp8Config(pretrained=True)  # from-scratch arch + pretrained -> rejected
+    raised = False
+    try:
+        _build_model(cfg, "resnet18")
+    except ValueError:
+        raised = True
+    assert raised, "pretrained=True with a from-scratch arch must raise"
 
 
 def test_resolve_checkpoint_epochs() -> None:
@@ -144,9 +176,31 @@ def test_aggregate() -> None:
     assert agg["n_seeds"] == 2
 
 
+def test_a1_imagenet32_profile() -> None:
+    cfg = Exp8Config.a1_imagenet32()
+    assert cfg.dataset == "imagenet32", "a1_imagenet32 measures on ImageNet-32"
+    assert cfg.num_classes == 1001, "the HF mirror keeps the index-0 background class"
+    assert cfg.archs == ["resnet18", "plain_resnet18"], "same inversion pair as a1"
+
+
+def test_hf_image_classification_wrapper() -> None:
+    split = [{"image": Image.new("RGB", (32, 32)), "label": 7} for _ in range(3)]
+    ds = _HFImageClassification(split, _imagenet32_transforms(train=False))
+    assert len(ds) == 3, "wrapper length follows the split"
+    image, label = ds[0]
+    assert image.shape == (3, 32, 32), "32x32 RGB tensor"
+    assert image.dtype == torch.float32 and label == 7, "normalized tensor + int label"
+
+
 if __name__ == "__main__":
     test_build_model_dispatch()
     print("build_model_dispatch: OK")
+
+    test_build_model_resnet34_and_width()
+    print("build_model_resnet34_and_width: OK")
+
+    test_build_model_pretrained_guard()
+    print("build_model_pretrained_guard: OK")
 
     test_resolve_checkpoint_epochs()
     print("resolve_checkpoint_epochs: OK")
@@ -159,5 +213,11 @@ if __name__ == "__main__":
 
     test_aggregate()
     print("aggregate: OK")
+
+    test_a1_imagenet32_profile()
+    print("a1_imagenet32_profile: OK")
+
+    test_hf_image_classification_wrapper()
+    print("hf_image_classification_wrapper: OK")
 
     print("test_exp8: all checks passed")

@@ -330,6 +330,28 @@ class Exp8Config:
         return cls()
 
     @classmethod
+    def a1_width(cls) -> Exp8Config:
+        """A1 width/depth axis: ResNet-18 at 0.5x / 1x / 2x width + ResNet-34 on CIFAR-100.
+
+        Complements a1's skip-vs-plain inversion with the capacity axis the plan ties to
+        R#2 #6: how Phi scales with width (at fixed depth) and with depth (ResNet-34), from
+        scratch on CIFAR-100. Same schedule / seeds / checkpoints as `a1_from_scratch`.
+        """
+        return cls(archs=["resnet18_w0.5", "resnet18", "resnet18_w2.0", "resnet34"])
+
+    @classmethod
+    def a1_imagenet32(cls) -> Exp8Config:
+        """A1 anchor on ImageNet-32: ResNet-18 vs plain ResNet-18 (1001 classes), on-demand.
+
+        The plan's scale anchor for the inversion headline - the same skip-vs-plain
+        comparison as `a1_from_scratch`, on downsampled ImageNet-1k (32x32) instead of
+        CIFAR-100. Heavy (1.28M images, fetched from the Hugging Face hub on demand), so it
+        is not part of the default sweep. The mirror keeps the index-0 background class, so
+        the head has 1001 outputs.
+        """
+        return cls(dataset="imagenet32", num_classes=1001)
+
+    @classmethod
     def a2_pretrained(cls) -> Exp8Config:
         """A2: ImageNet-pretrained ResNet-50, Phi measured pre-finetune on Stanford Cars.
 
@@ -353,4 +375,71 @@ class Exp8Config:
                 weight_decay=1e-4,
                 scheduler="none",
             ),
+        )
+
+
+@dataclass
+class Exp9Config:
+    """Exp9: Stage-A "A3" frozen-transformer Phi ladder (the diagnosis, in language models).
+
+    Carries exp8's parameter-space blind-spot diagnostic onto decoder-only transformers:
+    with NO training, for each frozen model it measures the discarded-coupling fraction Phi
+    (Delta-M1) and the coupling field C(v, w) that locates it (Delta-M2). Attention is kept
+    *visible* (``attn_granularity = "qkv"``) so the coupling the paper isolates in attention
+    (H^T_{Q,K} != 0, exp5) is read off directly. The "A3" question is how Phi climbs the
+    model-size ladder and whether pretraining (source (P)) inflates it.
+
+    Two backends share this schema:
+      A3-toy (local, dependency-free) - `SegmentedTransformer` at growing sizes, measured
+        on a random token minibatch; this is the default sweep and what the tests run; see
+        `a3_toy`.
+      A3-llm (on-demand) - frozen Hugging Face causal LMs (Qwen2.5 size sweep + a Llama-3.1
+        cross-check), loaded in bf16 with gradients enabled; the larger rungs need on-demand
+        accelerator memory; see `a3_llm`.
+
+    The model is built (toy) or loaded (hf) once per id under a fixed build seed; ``seeds``
+    then vary only the Hutchinson probes, so their spread reports measurement precision.
+    """
+
+    backend: str = "toy"  # "toy" | "hf"
+    # Toy size presets (see experiments.llm._TOY_PRESETS) or Hugging Face model ids.
+    models: list[str] = field(default_factory=lambda: ["tiny", "small", "base"])
+    seq_len: int = 64
+    hessian_batch_size: int = 8  # minibatch subsampled for the Hessian measurement
+    n_probes: int = 8  # Hutchinson probes per block (raised per publication)
+    dtype: str = "float32"  # "float32" | "bfloat16"
+    attn_granularity: str = "qkv"  # "qkv" (attention visible) | "block" (coarse)
+    # Coupling-field scope: None measures every block pair (O(L^2); the toy ladder). An
+    # int k keeps only pairs within k blocks in group order plus all intra-layer pairs, so
+    # the on-demand LLM ladder stays O(L) without losing the attention hotspots.
+    coupling_band: int | None = None
+    seeds: list[int] = field(default_factory=lambda: [42, 43, 44])
+
+    @classmethod
+    def a3_toy(cls) -> Exp9Config:
+        """A3-toy: local, dependency-free ladder over toy decoder sizes (tiny->small->base)."""
+        return cls()
+
+    @classmethod
+    def a3_llm(cls) -> Exp9Config:
+        """A3-llm: on-demand frozen-LLM ladder (Qwen2.5 size sweep + a Llama-3.1 cross-check).
+
+        Loaded in bf16 with gradients enabled for the parameter-space measurement; the
+        larger rungs need on-demand accelerator memory. 4-bit weights are out of scope
+        (not differentiable). Requires the optional ``transformers`` dependency.
+        """
+        return cls(
+            backend="hf",
+            models=[
+                "Qwen/Qwen2.5-0.5B",
+                "Qwen/Qwen2.5-1.5B",
+                "Qwen/Qwen2.5-3B",
+                "Qwen/Qwen2.5-7B",
+                "meta-llama/Llama-3.1-8B",
+            ],
+            seq_len=128,
+            hessian_batch_size=4,
+            n_probes=8,
+            dtype="bfloat16",
+            coupling_band=8,
         )

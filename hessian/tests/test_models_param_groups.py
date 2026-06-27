@@ -18,7 +18,13 @@ _ROOT = Path(__file__).resolve().parents[2]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from experiments.models import SegmentedResNet18, SegmentedResNet50  # noqa: E402
+from experiments.models import (  # noqa: E402
+    SegmentedPlainResNet18,
+    SegmentedResNet18,
+    SegmentedResNet34,
+    SegmentedResNet50,
+    SegmentedWideResNet18,
+)
 from hessian.param_space import ParamBlockEstimator  # noqa: E402
 
 _EXPECTED_GROUPS = ["stem", "layer1", "layer2", "layer3", "layer4", "head"]
@@ -73,6 +79,26 @@ def test_resnet18_is_param_grouped_model_for_curvature() -> None:
     assert list(coupling.keys()) == expected_pairs, "coupling pairs/order wrong"
 
 
+def test_param_groups_partition_plain_resnet18() -> None:
+    _assert_partitions(SegmentedPlainResNet18(num_classes=10))
+
+
+def test_param_groups_partition_resnet34() -> None:
+    _assert_partitions(SegmentedResNet34(num_classes=10))
+
+
+def test_wide_resnet18_partition_shape_and_scaling() -> None:
+    counts = {}
+    for width in (0.5, 1.0, 2.0):
+        model = SegmentedWideResNet18(num_classes=10, width_mult=width)
+        _assert_partitions(model)
+        assert model(torch.randn(2, 3, 32, 32)).shape == (2, 10), f"shape at {width}x"
+        counts[width] = sum(p.numel() for p in model.parameters())
+    assert counts[0.5] < counts[1.0] < counts[2.0], "width must scale capacity"
+    tv_count = sum(p.numel() for p in SegmentedResNet18(num_classes=10).parameters())
+    assert counts[1.0] == tv_count, "width 1.0 must reproduce standard ResNet-18 widths"
+
+
 if __name__ == "__main__":
     test_param_groups_partition_resnet18()
     print("param_groups_partition_resnet18: OK")
@@ -82,5 +108,14 @@ if __name__ == "__main__":
 
     test_resnet18_is_param_grouped_model_for_curvature()
     print("resnet18_is_param_grouped_model_for_curvature: OK")
+
+    test_param_groups_partition_plain_resnet18()
+    print("param_groups_partition_plain_resnet18: OK")
+
+    test_param_groups_partition_resnet34()
+    print("param_groups_partition_resnet34: OK")
+
+    test_wide_resnet18_partition_shape_and_scaling()
+    print("wide_resnet18_partition_shape_and_scaling: OK")
 
     print("test_models_param_groups: all checks passed")

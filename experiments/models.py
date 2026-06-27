@@ -434,6 +434,50 @@ def _disable_shortcuts(base: nn.Module) -> None:
             module.downsample = None
 
 
+class _WideResNet(ResNet):
+    """torchvision BasicBlock ResNet with every stage width scaled by ``width_mult``.
+
+    torchvision forbids width scaling for ``BasicBlock`` (``base_width`` must stay 64) and
+    hardcodes the stage widths 64/128/256/512, so the stock factory cannot build a 0.5x or
+    2x ResNet-18. This rebuilds the stem and the four stages at the scaled widths while
+    reusing the official ``BasicBlock`` and the inherited ``_make_layer`` / ``forward`` (the
+    residual logic is unchanged); at ``width_mult = 1.0`` it reproduces the standard
+    ResNet-18 channel counts exactly.
+    """
+
+    def __init__(self, layers: list[int], num_classes: int, width_mult: float) -> None:
+        nn.Module.__init__(self)
+        self._norm_layer = nn.BatchNorm2d
+        self.groups = 1
+        self.base_width = 64
+        self.dilation = 1
+        widths = [
+            round(64 * width_mult),
+            round(128 * width_mult),
+            round(256 * width_mult),
+            round(512 * width_mult),
+        ]
+        self.inplanes = widths[0]
+        self.conv1 = nn.Conv2d(
+            3, self.inplanes, kernel_size=7, stride=2, padding=3, bias=False
+        )
+        self.bn1 = self._norm_layer(self.inplanes)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.layer1 = self._make_layer(BasicBlock, widths[0], layers[0])
+        self.layer2 = self._make_layer(BasicBlock, widths[1], layers[1], stride=2)
+        self.layer3 = self._make_layer(BasicBlock, widths[2], layers[2], stride=2)
+        self.layer4 = self._make_layer(BasicBlock, widths[3], layers[3], stride=2)
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(widths[3] * BasicBlock.expansion, num_classes)
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+
 class SegmentedResNet18(nn.Module):
     """ResNet-18 with segmentation for inter-layer Hessian computation.
 
@@ -579,6 +623,40 @@ class SegmentedResNet50(SegmentedResNet18):
             base.fc = nn.Linear(base.fc.in_features, num_classes)
             return base
         return tv_models.resnet50(num_classes=num_classes)
+
+
+class SegmentedResNet34(SegmentedResNet18):
+    """ResNet-34 sharing SegmentedResNet18's segmentation (deeper BasicBlock stack).
+
+    Same six segments / five measurement points (stem, layer1-4, head); only the depth
+    differs (BasicBlock layers [3, 4, 6, 3] vs [2, 2, 2, 2]). Provides the depth rung of
+    the Stage-A width/depth sweep (`Exp8Config.a1_width`).
+    """
+
+    def _make_base(self, num_classes: int) -> ResNet:
+        return tv_models.resnet34(num_classes=num_classes)
+
+
+class SegmentedWideResNet18(SegmentedResNet18):
+    """ResNet-18 with all stage widths scaled by ``width_mult`` (the width axis).
+
+    Shares SegmentedResNet18's segmentation contract: the channel counts change but the
+    six conv1 / bn1 / layer1-4 / fc measurement points do not, so `get_param_groups` and
+    `get_segments` apply unchanged. ``width_mult = 1.0`` reproduces the standard ResNet-18.
+    """
+
+    def __init__(
+        self,
+        num_classes: int = 10,
+        *,
+        width_mult: float = 1.0,
+        activation: str = "relu",
+    ) -> None:
+        self._width_mult = width_mult
+        super().__init__(num_classes=num_classes, activation=activation)
+
+    def _make_base(self, num_classes: int) -> ResNet:
+        return _WideResNet([2, 2, 2, 2], num_classes, self._width_mult)
 
 
 # ======================================================================

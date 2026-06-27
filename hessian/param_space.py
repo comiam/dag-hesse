@@ -34,7 +34,7 @@ Complexity: O((L+1) m) HVPs for Phi (L groups + full), O(P) memory.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -42,11 +42,21 @@ import torch
 from torch import Tensor
 from torch.nn import Parameter
 
-from ._estimators import HVPClosure, hutchinson_frob_sq
+from ._estimators import HVPClosure, rademacher_batch
 from .metrics import coupling_from_norms
 from .types import LayerID
 
 _EPS = 1e-12
+
+# Batched-probe memory control. On CUDA the per-chunk probe count is sized to a fraction
+# of *currently free* device memory, so a 2 GB laptop GPU and a 40 GB accelerator both
+# stay safe; on CPU a fixed element budget is used. The vmapped double-backward also
+# carries (chunk x backward-intermediate) buffers that cannot be sized analytically, so
+# `_frob_sq_batched` additionally halves the chunk on an OutOfMemoryError, down to single
+# probes (the original looped behaviour) before giving up.
+_BYTES_PER_ELEM = 4
+_PROBE_MEM_FRACTION = 0.2
+_PROBE_ELEM_BUDGET = 1 << 25  # CPU fallback (~33.5M elements, ~128 MB fp32)
 
 
 class ParamGroupedModel(Protocol):
@@ -185,7 +195,13 @@ class ParamBlockEstimator:
         diag_sq = sum(self._block_frob_sq(graph, name, name) for name in graph.names)
         return 1.0 - diag_sq / full_sq
 
-    def estimate_phi_report(self, x: Tensor, y: Tensor) -> PhiReport:
+    def estimate_phi_report(
+        self,
+        x: Tensor,
+        y: Tensor,
+        *,
+        coupling_pairs: Iterable[tuple[LayerID, LayerID]] | None = None,
+    ) -> PhiReport:
         """Phi plus its diagonal-mass and coupling localization, from one backward graph.
 
         The Stage-A diagnostic bundle (Delta-M1/M2): one full-parameter probe set gives
@@ -194,19 +210,46 @@ class ParamBlockEstimator:
         block is measured once and reused for both Phi and the couplings that contain it
         - the same single-graph amortization as `curvature`'s deferred ``coupling``,
         exposed here for measurement rather than for a step.
+
+        ``coupling_pairs`` restricts the (always group-major) coupling field to a caller-
+        chosen subset of (v, w) pairs; ``None`` measures every v-before-w pair. When all
+        off-diagonal blocks are measured, ``||H||_F^2`` is taken as the exact block
+        decomposition ``sum_v ||H_vv||_F^2 + 2 sum_{v<w} ||H_vw||_F^2`` (using
+        ``||H_vw||_F = ||H_wv||_F``), so no separate full-parameter probe is drawn - it is
+        the single largest allocation - and Phi is guaranteed to land in [0, 1). A subset
+        (e.g. a depth band for a many-block transformer) leaves that sum incomplete, so
+        ``||H||_F^2`` then falls back to a full-parameter Hutchinson probe.
         """
         graph = self._grad_graph(x, y)
-        full_sq = self._full_frob_sq(graph)
         diag_sq = {v: self._block_frob_sq(graph, v, v) for v in graph.names}
-        phi = math.nan if full_sq < _EPS else 1.0 - sum(diag_sq.values()) / full_sq
         diag_frob = {v: s**0.5 for v, s in diag_sq.items()}
 
+        if coupling_pairs is None:
+            names = graph.names
+            pairs: Iterable[tuple[LayerID, LayerID]] = [
+                (v, names[j])
+                for i, v in enumerate(names)
+                for j in range(i + 1, len(names))
+            ]
+        else:
+            pairs = coupling_pairs
         coupling: dict[tuple[LayerID, LayerID], float] = {}
-        names = graph.names
-        for i, v in enumerate(names):
-            for w in names[i + 1 :]:
-                r_vw = self._block_frob_sq(graph, v, w) ** 0.5
-                coupling[(v, w)] = coupling_from_norms(r_vw, diag_frob[v], diag_frob[w])
+        offdiag_sq = 0.0
+        for v, w in pairs:
+            block_sq = self._block_frob_sq(graph, v, w)
+            offdiag_sq += block_sq
+            coupling[(v, w)] = coupling_from_norms(
+                block_sq**0.5, diag_frob[v], diag_frob[w]
+            )
+
+        diag_total = sum(diag_sq.values())
+        if coupling_pairs is None:
+            # Every off-diagonal block measured: the exact block decomposition of
+            # ||H||_F^2, so Phi needs no separate full-parameter probe and stays in [0, 1).
+            full_sq = diag_total + 2.0 * offdiag_sq
+        else:
+            full_sq = self._full_frob_sq(graph)
+        phi = math.nan if full_sq < _EPS else 1.0 - diag_total / full_sq
 
         return PhiReport(phi=phi, diag_frob=diag_frob, coupling=coupling)
 
@@ -282,14 +325,77 @@ class ParamBlockEstimator:
     # ------------------------------------------------------------------
 
     def _block_frob_sq(self, graph: _ParamGraph, v: LayerID, w: LayerID) -> float:
-        """||H_{theta_v, theta_w}||_F^2 via Hutchinson on the cross-block HVP."""
-        hvp = self._cross_block_hvp(graph.params[v], graph.grads[w])
-        return hutchinson_frob_sq(hvp, graph.dims[w], self._n_probes, graph.device)
+        """||H_{theta_v, theta_w}||_F^2 via batched Hutchinson on the cross-block HVP."""
+        return self._frob_sq_batched(graph.params[v], graph.grads[w], graph.dims[w])
 
     def _full_frob_sq(self, graph: _ParamGraph) -> float:
-        """||H||_F^2 via Hutchinson on the full-parameter HVP."""
-        hvp = self._cross_block_hvp(graph.all_params, graph.all_grads)
-        return hutchinson_frob_sq(hvp, graph.total_dim, self._n_probes, graph.device)
+        """||H||_F^2 via batched Hutchinson on the full-parameter HVP."""
+        return self._frob_sq_batched(graph.all_params, graph.all_grads, graph.total_dim)
+
+    def _frob_sq_batched(
+        self,
+        out_params: list[Parameter],
+        grad_probe: list[Tensor],
+        dim_probe: int,
+    ) -> float:
+        """||H_{out, probe}||_F^2 via Hutchinson with *batched* Rademacher probes.
+
+        One vectorized double-backward (``is_grads_batched``) replaces the per-probe
+        Python loop: the probes are stacked into (m, dim_probe) and pushed through the
+        retained graph at once. ``m`` is sized to a fraction of free device memory (see
+        `_probe_chunk`) and halved on an OutOfMemoryError, so the full-parameter HVP on a
+        large model on a small GPU degrades to single probes instead of overflowing.
+        ``allow_unused`` coordinates return None and contribute zero to the sum of
+        squares, so they are simply skipped.
+        """
+        flat_grad = torch.cat([g.reshape(-1) for g in grad_probe])
+        device = flat_grad.device
+        chunk = self._probe_chunk(out_params, dim_probe, device)
+
+        total = torch.zeros((), device=device)
+        drawn = 0
+        while drawn < self._n_probes:
+            m = min(chunk, self._n_probes - drawn)
+            try:
+                probes = rademacher_batch(m, dim_probe, device)
+                grads = torch.autograd.grad(
+                    flat_grad,
+                    out_params,
+                    grad_outputs=probes,
+                    retain_graph=True,
+                    allow_unused=True,
+                    is_grads_batched=True,
+                )
+            except torch.cuda.OutOfMemoryError:
+                if m == 1:
+                    raise
+                torch.cuda.empty_cache()
+                chunk = max(1, m // 2)
+                continue
+            for g in grads:
+                if g is not None:
+                    total = total + (g.reshape(m, -1) ** 2).sum()
+            drawn += m
+        return (total / self._n_probes).item()
+
+    def _probe_chunk(
+        self, out_params: list[Parameter], dim_probe: int, device: torch.device
+    ) -> int:
+        """Number of probes to batch per double-backward, sized to fit device memory.
+
+        Each probe holds its (dim_probe) Rademacher vector and a (dim_out) grad slice; on
+        CUDA the chunk takes a fraction of currently-free memory, on CPU a fixed element
+        budget. The result is clamped to [1, n_probes]; the OutOfMemoryError back-off in
+        `_frob_sq_batched` covers the unmodellable vmapped-backward buffers on top.
+        """
+        dim_out = sum(p.numel() for p in out_params)
+        per_probe = max(1, dim_out + dim_probe)
+        if device.type == "cuda":
+            free, _ = torch.cuda.mem_get_info(device)
+            budget = int(free * _PROBE_MEM_FRACTION) // _BYTES_PER_ELEM
+        else:
+            budget = _PROBE_ELEM_BUDGET
+        return max(1, min(self._n_probes, budget // per_probe))
 
     def _coupling_dict(
         self, graph: _ParamGraph

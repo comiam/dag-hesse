@@ -42,6 +42,21 @@ def _rademacher(
     return bits.float() * 2 - 1
 
 
+def rademacher_batch(
+    n: int,
+    dim: int,
+    device: torch.device,
+    generator: torch.Generator | None = None,
+) -> Tensor:
+    """``n`` stacked Rademacher vectors as one (n, dim) tensor in {-1, +1}.
+
+    The batched counterpart of `_rademacher`, for vectorized (``is_grads_batched``)
+    Hutchinson probes where the whole probe block is drawn and applied at once.
+    """
+    bits = torch.randint(0, 2, (n, dim), device=device, generator=generator)
+    return bits.float() * 2 - 1
+
+
 def hutchinson_frob_sq(
     hvp: HVPClosure,
     dim: int,
@@ -62,12 +77,12 @@ def hutchinson_frob_sq(
     Returns:
         (1/m) sum_k ||H z_k||^2 - an unbiased estimate of ||H||_F^2.
     """
-    frob_sq = 0.0
+    frob_sq = torch.zeros((), device=device)
     for _ in range(n_probes):
         z = _rademacher(dim, device, generator)
         hz = hvp(z)
-        frob_sq += (hz**2).sum().item()
-    return frob_sq / n_probes
+        frob_sq = frob_sq + (hz**2).sum()
+    return (frob_sq / n_probes).item()
 
 
 def power_iteration_spectral_sq(

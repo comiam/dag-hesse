@@ -29,6 +29,7 @@ dependencies = [
     "curvlinops-for-pytorch>=3.0",
     "kagglehub>=1.0.2",
     "pillow>=12.2.0",
+    "datasets>=5.0.0",
 ]
 
 [project.urls]

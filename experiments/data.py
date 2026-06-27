@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import os
 import random
+from typing import Any
 
 import kagglehub
 import scipy.io as sio
@@ -302,6 +303,111 @@ def get_stanford_cars_loaders(
     val_ds = _StanfordCarsSplit(
         [samples[i] for i in val_idx],
         _cars_transforms(image_size, train=False),
+    )
+    persistent = num_workers > 0
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=persistent,
+        drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=persistent,
+    )
+    return train_loader, val_loader
+
+
+# ======================================================================
+# ImageNet-32 (downsampled ImageNet-1k, 32x32) - Stage-A anchor (exp8)
+# ======================================================================
+
+_IMAGENET32_HF_ID = "benjamin-paine/imagenet-1k-32x32"
+
+
+def _imagenet32_transforms(*, train: bool) -> T.Compose:
+    """CIFAR-style 32x32 transforms with ImageNet normalization.
+
+    Train: RandomCrop(32, padding=4) + horizontal flip; eval: normalization only. The
+    images are already 32x32, so no resize is needed.
+    """
+    if train:
+        return T.Compose(
+            [
+                T.RandomCrop(32, padding=4),
+                T.RandomHorizontalFlip(),
+                T.ToTensor(),
+                T.Normalize(_IMAGENET_MEAN, _IMAGENET_STD),
+            ]
+        )
+    return T.Compose(
+        [
+            T.ToTensor(),
+            T.Normalize(_IMAGENET_MEAN, _IMAGENET_STD),
+        ]
+    )
+
+
+class _HFImageClassification(Dataset):
+    """A Hugging Face image-classification split with a torchvision transform applied lazily.
+
+    Wraps a split whose records follow the standard Hugging Face image schema
+    (``{"image": PIL.Image, "label": int}``) so it plugs into a torch ``DataLoader`` like
+    the other datasets here; the image is converted to RGB and transformed on access.
+    """
+
+    def __init__(self, split: Any, transform: T.Compose) -> None:
+        self._split = split
+        self._transform = transform
+
+    def __len__(self) -> int:
+        return len(self._split)
+
+    def __getitem__(self, index: int) -> tuple[Tensor, int]:
+        record = self._split[index]
+        image = self._transform(record["image"].convert("RGB"))
+        return image, int(record["label"])
+
+
+def get_imagenet32_loaders(
+    batch_size: int,
+    *,
+    augment: bool = True,
+    num_workers: int = 4,
+) -> tuple[DataLoader, DataLoader]:
+    """Returns (train_loader, val_loader) for ImageNet-1k downsampled to 32x32.
+
+    Fetched from the Hugging Face hub (`benjamin-paine/imagenet-1k-32x32`), which is gated:
+    authentication uses the standard ``HF_TOKEN`` environment variable (no token is read or
+    stored here). The labelled ``train`` (1.28M) and ``validation`` (50k) splits are used -
+    the ``test`` split is unlabelled and ignored; labels span 1001 classes (the mirror keeps
+    the index-0 background class). Images are 32x32, CIFAR-style augmented on the train split
+    and ImageNet-normalized. ``datasets`` is imported lazily so the rest of the package
+    imports without this heavy dependency.
+    """
+    try:
+        from datasets import load_dataset
+    except (
+        ImportError
+    ) as exc:  # pragma: no cover - exercised only on the imagenet32 path
+        raise ImportError(
+            "exp8 'imagenet32' needs the Hugging Face datasets package; install it with "
+            "`uv add datasets` (the optional ImageNet-32 anchor)."
+        ) from exc
+
+    dataset = load_dataset(_IMAGENET32_HF_ID)
+    train_ds = _HFImageClassification(
+        dataset["train"], _imagenet32_transforms(train=augment)
+    )
+    val_ds = _HFImageClassification(
+        dataset["validation"], _imagenet32_transforms(train=False)
     )
     persistent = num_workers > 0
     train_loader = DataLoader(
