@@ -36,7 +36,10 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from secondorder import CoupleFacOptimizer  # noqa: E402
-from secondorder.kfac_adapter import CurvlinopsKFACProvider  # noqa: E402
+from secondorder.kfac_adapter import (  # noqa: E402
+    CurvlinopsEKFACProvider,
+    CurvlinopsKFACProvider,
+)
 
 _DTYPE = torch.float64
 
@@ -313,6 +316,133 @@ def test_optimizer_with_real_kfac_backend() -> None:
     assert md <= m0 + 1e-7, f"no-harm violated with real K-FAC: m(d)={md} m(d0)={m0}"
 
 
+def test_single_linear_ekfac_is_exact_ggn() -> None:
+    """Bias-free linear + MSE: EKFAC's eigenvalue-corrected step -> exact GGN as lambda->0.
+
+    For a single layer the K-FAC factorisation is already exact, so EKFAC's eigenvalue
+    correction leaves it exact; with exact (eigenbasis) damping the inverse converges to
+    the exact GGN Newton step -(GGN)^{-1} g as lambda -> 0. Also exercises the float64
+    eigenbasis path the provider runs on its private double-precision copy of the model.
+    """
+    torch.manual_seed(0)
+    lam = 1e-8
+    model = _SingleLinear(d_in=4, d_out=3).double()
+    loss_fn = nn.MSELoss()
+    x = torch.randn(6, 4, dtype=_DTYPE)
+    t = torch.randn(6, 3, dtype=_DTYPE)
+    groups = model.get_param_groups()
+    params = _params_in_order(groups)
+
+    g = _flat_grad(model, loss_fn, x, t, groups)
+    ggn = _exact_param_hessian(model, loss_fn, x, t, params)
+    expected = torch.linalg.solve(ggn, -g)  # exact GGN Newton step (undamped)
+
+    provider = CurvlinopsEKFACProvider(model, loss_fn, damping=lam).update(x, t)
+    d0 = provider.base_direction(g)
+
+    err = (d0 - expected).abs().max().item()
+    assert torch.allclose(
+        d0, expected, atol=1e-6
+    ), f"EKFAC != exact GGN in the lambda->0 limit (max err {err})"
+
+
+def test_ekfac_unsupported_params_get_identity_fallback() -> None:
+    """Conv + BN + skip: EKFAC acts on conv / head, the BatchNorm affines take -g.
+
+    Validates the EKFAC wiring on a convolutional net with an unsupported BatchNorm. The
+    provider builds its eigenbasis on the private float64 copy - the precision that keeps
+    the mandatory exact-damping eigendecomposition convergent on the (rank-deficient) conv
+    factors of a real network - and routes the identity step -g to the norm affines.
+    """
+    torch.manual_seed(0)
+    model = _ConvBNNet(c=3, h=4, n_cls=2).double().eval()
+    loss_fn = nn.MSELoss()
+    x = torch.randn(8, 3, 4, 4, dtype=_DTYPE)
+    t = torch.randn(8, 2, dtype=_DTYPE)
+    groups = model.get_param_groups()
+
+    g = _flat_grad(model, loss_fn, x, t, groups)
+    provider = CurvlinopsEKFACProvider(model, loss_fn, damping=1e-2).update(x, t)
+    d0 = provider.base_direction(g)
+    ranges = provider.block_ranges()
+
+    assert torch.isfinite(d0).all(), "EKFAC direction must be finite on the conv net"
+    bn = ranges["bn"]
+    assert torch.allclose(
+        d0[bn], -g[bn], atol=1e-12
+    ), "unsupported BatchNorm params must take the identity step -g"
+    sup = torch.cat([d0[ranges["conv"]], d0[ranges["head"]]])
+    sup_id = torch.cat([-g[ranges["conv"]], -g[ranges["head"]]])
+    assert not torch.allclose(
+        sup, sup_id
+    ), "supported conv / head must be curvature-modified, not identity"
+
+
+def test_ekfac_base_direction_requires_update() -> None:
+    """EKFAC base_direction without a prior update is a usage error, not silent garbage."""
+    model = _ResidualMLP().double()
+    provider = CurvlinopsEKFACProvider(model, nn.CrossEntropyLoss())
+    raised = False
+    try:
+        provider.base_direction(torch.zeros(1, dtype=_DTYPE))
+    except RuntimeError:
+        raised = True
+    assert raised, "EKFAC base_direction must require update() first"
+
+
+def test_ekfac_eval_collection_handles_train_mode() -> None:
+    """A live model in train mode is fine: factors are collected on the eval double copy.
+
+    The provider builds its eigenbasis on a private eval-mode float64 copy, so a model left
+    in train mode (BatchNorm in batch-statistic mode) does not destabilise the
+    eigendecomposition; conv / head get EKFAC, the BatchNorm affines the identity step.
+    """
+    torch.manual_seed(0)
+    model = (
+        _ConvBNNet(c=3, h=4, n_cls=2).double().train()
+    )  # live model left in TRAIN mode
+    loss_fn = nn.MSELoss()
+    x = torch.randn(8, 3, 4, 4, dtype=_DTYPE)
+    t = torch.randn(8, 2, dtype=_DTYPE)
+    groups = model.get_param_groups()
+
+    g = _flat_grad(model, loss_fn, x, t, groups)
+    provider = CurvlinopsEKFACProvider(model, loss_fn, damping=1e-2).update(x, t)
+    d0 = provider.base_direction(g)
+    ranges = provider.block_ranges()
+
+    assert torch.isfinite(
+        d0
+    ).all(), "EKFAC must stay finite for a train-mode live model"
+    assert torch.allclose(
+        d0[ranges["bn"]], -g[ranges["bn"]], atol=1e-12
+    ), "BatchNorm affines take the identity step"
+
+
+def test_ekfac_amortizes_refresh() -> None:
+    """With refresh_period > 1 the eigenbasis is rebuilt only on the scheduled updates."""
+    torch.manual_seed(0)
+    model = _ResidualMLP(d=5, d_out=3).double()
+    loss_fn = nn.CrossEntropyLoss()
+    x = torch.randn(8, 5, dtype=_DTYPE)
+    y = torch.randint(0, 3, (8,))
+
+    provider = CurvlinopsEKFACProvider(model, loss_fn, damping=1e-1, refresh_period=2)
+    provider.update(x, y)
+    first = provider._inverse  # built at call 0
+    provider.update(x, y)
+    assert (
+        provider._inverse is first
+    ), "an update within the period reuses the eigenbasis"
+    provider.update(x, y)
+    assert (
+        provider._inverse is not first
+    ), "the scheduled update rebuilds the eigenbasis"
+
+    g = _flat_grad(model, loss_fn, x, y, model.get_param_groups())
+    assert torch.isfinite(provider.base_direction(g)).all()
+
+
 if __name__ == "__main__":
     test_single_linear_kfac_is_exact_ggn()
     test_residual_mlp_is_architecture_agnostic()
@@ -320,4 +450,9 @@ if __name__ == "__main__":
     test_block_ranges_partition()
     test_base_direction_requires_update()
     test_optimizer_with_real_kfac_backend()
+    test_single_linear_ekfac_is_exact_ggn()
+    test_ekfac_unsupported_params_get_identity_fallback()
+    test_ekfac_base_direction_requires_update()
+    test_ekfac_eval_collection_handles_train_mode()
+    test_ekfac_amortizes_refresh()
     print("kfac_adapter: all checks passed")

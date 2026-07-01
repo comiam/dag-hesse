@@ -19,6 +19,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from experiments.models import (  # noqa: E402
+    SegmentedMLP,
     SegmentedPlainResNet18,
     SegmentedResNet18,
     SegmentedResNet34,
@@ -99,6 +100,19 @@ def test_wide_resnet18_partition_shape_and_scaling() -> None:
     assert counts[1.0] == tv_count, "width 1.0 must reproduce standard ResNet-18 widths"
 
 
+def test_segmented_mlp_param_groups() -> None:
+    """SegmentedMLP exposes one group per Linear layer, partitioning its parameters."""
+    model = SegmentedMLP(in_dim=16, hidden=16, depth=2, num_classes=4)
+    groups = model.get_param_groups()
+    assert list(groups.keys()) == ["fc0", "fc1", "head"], f"groups: {list(groups)}"
+
+    grouped = [p for ps in groups.values() for p in ps]
+    grouped_ids = {id(p) for p in grouped}
+    assert len(grouped_ids) == len(grouped), "a parameter appears in two groups"
+    assert grouped_ids == {id(p) for p in model.parameters()}, "groups must partition"
+    assert model(torch.randn(3, 16)).shape == (3, 4), "forward maps (B, in) -> (B, cls)"
+
+
 if __name__ == "__main__":
     test_param_groups_partition_resnet18()
     print("param_groups_partition_resnet18: OK")
@@ -117,5 +131,8 @@ if __name__ == "__main__":
 
     test_wide_resnet18_partition_shape_and_scaling()
     print("wide_resnet18_partition_shape_and_scaling: OK")
+
+    test_segmented_mlp_param_groups()
+    print("segmented_mlp_param_groups: OK")
 
     print("test_models_param_groups: all checks passed")

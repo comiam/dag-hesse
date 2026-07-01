@@ -79,12 +79,13 @@ def _build_loaders(cfg: Exp8Config) -> tuple[DataLoader, DataLoader]:
     if cfg.dataset == "cifar10":
         return get_cifar10_image_loaders(batch_size)
     if cfg.dataset == "imagenet32":
-        return get_imagenet32_loaders(batch_size)
+        return get_imagenet32_loaders(batch_size, num_workers=cfg.num_workers)
     if cfg.dataset == "stanford_cars":
         return get_stanford_cars_loaders(
             batch_size,
             image_size=cfg.image_size,
             augment=False,  # diagnostic only: measure on un-augmented inputs
+            num_workers=cfg.num_workers,
             seed=_SPLIT_SEED,
         )
     raise ValueError(f"unknown dataset {cfg.dataset!r}")

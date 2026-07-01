@@ -22,7 +22,11 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from experiments.config import Exp7Config  # noqa: E402
-from experiments.models import SegmentedResNet18, SegmentedResNet50  # noqa: E402
+from experiments.models import (  # noqa: E402
+    SegmentedMLP,
+    SegmentedResNet18,
+    SegmentedResNet50,
+)
 from experiments.runner_exp7 import (  # noqa: E402
     _aggregate_method,
     _build_model,
@@ -78,6 +82,20 @@ def _assert_hook_updates(
     assert not torch.allclose(before, after), "hook did not change any parameter"
 
 
+def _mlp_batch(seed: int = 0) -> tuple[SegmentedMLP, Tensor, Tensor]:
+    """A full-rank MLP (`ParamGroupedModel`) + low-dim batch - the clean EKFAC regime.
+
+    Low input dimension and batch >= width keep every Kronecker factor full rank, so
+    EKFAC's eigenbasis is well posed - the setting where the optimizer-agnostic overlay is
+    demonstrated alongside the (rank-deficient) convolutional headline.
+    """
+    torch.manual_seed(seed)
+    model = SegmentedMLP(in_dim=16, hidden=16, depth=2, num_classes=4).to(_DEVICE)
+    x = torch.randn(32, 16, device=_DEVICE)
+    y = torch.randint(0, 4, (32,), device=_DEVICE)
+    return model, x, y
+
+
 def test_newton_cg_solves_damped_system() -> None:
     torch.manual_seed(0)
     n = 12
@@ -112,6 +130,27 @@ def test_couplefac_hook_overlay_updates() -> None:
     _assert_hook_updates(model, ctx, hook)
 
 
+def test_couplefac_hook_ekfac_updates() -> None:
+    """EKFAC base step (overlay off) on the full-rank MLP: a finite in-place update."""
+    model, x, y = _mlp_batch()
+    hook = build_couplefac_hook(
+        model, _tiny_cfg(), tau=float("inf"), kind="ekfac", seed=0, device=_DEVICE
+    )
+    ctx = StepCtx(model=model, x=x, y=y, step=0, device=_DEVICE)
+    _assert_hook_updates(model, ctx, hook)
+
+
+def test_couplefac_hook_ekfac_overlay_updates() -> None:
+    """EKFAC + coupling-gated overlay on the full-rank MLP (the agnostic-overlay path)."""
+    model, x, y = _mlp_batch()
+    cfg = _tiny_cfg()
+    hook = build_couplefac_hook(
+        model, cfg, tau=cfg.tau, kind="ekfac", seed=0, device=_DEVICE
+    )
+    ctx = StepCtx(model=model, x=x, y=y, step=0, device=_DEVICE)
+    _assert_hook_updates(model, ctx, hook)
+
+
 def test_newton_cg_hook_updates() -> None:
     model, x, y = _resnet_batch()
     hook = build_newton_cg_hook(model, _tiny_cfg(), device=_DEVICE)
@@ -137,6 +176,9 @@ def test_build_model_dispatch() -> None:
 
     m18 = _build_model(Exp7Config(model="resnet18", num_classes=10))
     assert isinstance(m18, SegmentedResNet18) and not isinstance(m18, SegmentedResNet50)
+
+    mlp = _build_model(Exp7Config(model="mlp", num_classes=10))
+    assert isinstance(mlp, SegmentedMLP), "mlp key must build SegmentedMLP"
 
     raised = False
     try:
@@ -172,6 +214,12 @@ if __name__ == "__main__":
 
     test_couplefac_hook_overlay_updates()
     print("couplefac_hook_overlay_updates: OK")
+
+    test_couplefac_hook_ekfac_updates()
+    print("couplefac_hook_ekfac_updates: OK")
+
+    test_couplefac_hook_ekfac_overlay_updates()
+    print("couplefac_hook_ekfac_overlay_updates: OK")
 
     test_newton_cg_hook_updates()
     print("newton_cg_hook_updates: OK")

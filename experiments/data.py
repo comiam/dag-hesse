@@ -9,11 +9,53 @@ from typing import Any
 
 import kagglehub
 import scipy.io as sio
+import torch
 import torchvision
 import torchvision.transforms as T
 from PIL import Image
 from torch import Tensor
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, TensorDataset
+
+
+def get_synthetic_classification_loaders(
+    batch_size: int,
+    *,
+    in_dim: int = 64,
+    num_classes: int = 10,
+    n_train: int = 8192,
+    n_val: int = 2048,
+    label_noise: float = 0.15,
+    seed: int = 0,
+) -> tuple[DataLoader, DataLoader]:
+    """Deterministic low-dimensional synthetic classification (full-rank curvature).
+
+    A fixed two-layer random teacher labels low-dimensional Gaussian inputs, with a
+    fraction ``label_noise`` of labels randomised. The low input dimension keeps every
+    Kronecker factor full rank at a modest batch, and the irreducible label noise gives the
+    loss a positive floor so the output-gradient covariance does not collapse as the model
+    fits (which would make EKFAC's eigendecomposition degenerate) - together the clean,
+    well-conditioned setting for the optimizer-agnostic comparison (`Exp7Config.b1_mlp`).
+    Fully reproducible and dependency-free (no download).
+    """
+    gen = torch.Generator().manual_seed(seed)
+    hidden = 2 * in_dim
+    w1 = torch.randn(in_dim, hidden, generator=gen)
+    w2 = torch.randn(hidden, num_classes, generator=gen)
+
+    def _make(n: int) -> TensorDataset:
+        x = torch.randn(n, in_dim, generator=gen)
+        y = (torch.tanh(x @ w1) @ w2).argmax(dim=1)
+        if label_noise > 0:
+            flip = torch.rand(n, generator=gen) < label_noise
+            noise = torch.randint(0, num_classes, (n,), generator=gen)
+            y = torch.where(flip, noise, y)
+        return TensorDataset(x, y)
+
+    train_loader = DataLoader(
+        _make(n_train), batch_size=batch_size, shuffle=True, drop_last=True
+    )
+    val_loader = DataLoader(_make(n_val), batch_size=batch_size, shuffle=False)
+    return train_loader, val_loader
 
 
 def get_cifar10_loaders(

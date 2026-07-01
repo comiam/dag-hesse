@@ -45,14 +45,16 @@ from experiments.config import Exp7Config
 from experiments.data import (
     get_cifar10_image_loaders,
     get_cifar100_loaders,
+    get_imagenet32_loaders,
     get_stanford_cars_loaders,
+    get_synthetic_classification_loaders,
 )
-from experiments.models import SegmentedResNet18, SegmentedResNet50
+from experiments.models import SegmentedMLP, SegmentedResNet18, SegmentedResNet50
 from experiments.training import StepCtx, Trainer
 from experiments.utils import set_seed
 from hessian import ParamBlockEstimator, ParamGroupedModel
 from secondorder import CoupleFacOptimizer, CoupleFacOverlay, HessianOracle, Pair
-from secondorder.kfac_adapter import CurvlinopsKFACProvider
+from secondorder.kfac_adapter import CurvlinopsEKFACProvider, CurvlinopsKFACProvider
 
 logger = logging.getLogger(__name__)
 
@@ -65,8 +67,9 @@ _SECOND_ORDER_LR = 1.0
 _NEWTON_CG_ITERS = 20
 # Fixed seed for the train/val split, so every method and seed sees the same data.
 _SPLIT_SEED = 0
-
-_SECOND_ORDER_METHODS = frozenset({"kfac", "kfac+overlay", "newton_cg"})
+# Input dimension of the synthetic full-rank MLP task (`b1_mlp`); low enough that every
+# Kronecker factor is full rank at the configured batch, so EKFAC is well conditioned.
+_MLP_IN_DIM = 64
 
 
 # ======================================================================
@@ -144,21 +147,33 @@ def build_couplefac_hook(
     cfg: Exp7Config,
     *,
     tau: float,
+    kind: str = "kfac",
     seed: int,
     device: torch.device,
 ) -> Callable[[StepCtx], None]:
     """A Trainer step hook running one COUPLE-FAC update per minibatch.
 
-    With ``tau = +inf`` the selection set S = {C_{vw} > tau} is empty and the step is
-    the plain K-FAC direction (the ``kfac`` baseline); with a finite ``tau`` the
-    coupling-gated rank-r overlay is added and the no-harm safeguard accepts it only if
-    it does not worsen the exact local quadratic model. The coupling C is recomputed
-    only every ``measure_period`` steps.
+    ``kind`` selects the block-diagonal base preconditioner (``"kfac"`` or ``"ekfac"``);
+    the overlay machinery is identical for both. With ``tau = +inf`` the selection set
+    S = {C_{vw} > tau} is empty and the step is the plain base direction (the ``kfac`` /
+    ``ekfac`` baseline); with a finite ``tau`` the coupling-gated rank-r overlay is added
+    and the no-harm safeguard accepts it only if it does not worsen the exact local
+    quadratic model. The coupling C is recomputed only every ``measure_period`` steps.
     """
     loss_fn = nn.CrossEntropyLoss()
-    provider = CurvlinopsKFACProvider(
-        model, loss_fn, damping=cfg.damping, fisher_type=cfg.fisher_type
-    )
+    provider: CurvlinopsKFACProvider | CurvlinopsEKFACProvider
+    if kind == "ekfac":
+        provider = CurvlinopsEKFACProvider(
+            model,
+            loss_fn,
+            damping=cfg.damping,
+            fisher_type=cfg.fisher_type,
+            refresh_period=cfg.ekfac_refresh_period,
+        )
+    else:
+        provider = CurvlinopsKFACProvider(
+            model, loss_fn, damping=cfg.damping, fisher_type=cfg.fisher_type
+        )
     overlay = CoupleFacOverlay(
         rank=cfg.overlay_rank, n_power_iter=cfg.overlay_n_power_iter
     )
@@ -232,21 +247,26 @@ def _build_loaders(cfg: Exp7Config) -> tuple[DataLoader, DataLoader]:
         return get_cifar10_image_loaders(batch_size)
     if cfg.dataset == "cifar100":
         return get_cifar100_loaders(batch_size)
-    if cfg.dataset == "imagenet32":
-        raise NotImplementedError(
-            "the imagenet32 loader (Exp7 B2 control) is not implemented yet; "
-            "add it before running Exp7Config.b2_largebatch"
+    if cfg.dataset == "synthetic":
+        return get_synthetic_classification_loaders(
+            batch_size, in_dim=_MLP_IN_DIM, num_classes=cfg.num_classes
         )
+    if cfg.dataset == "imagenet32":
+        return get_imagenet32_loaders(batch_size, augment=cfg.augment)
     raise ValueError(f"unknown dataset {cfg.dataset!r}")
 
 
-def _build_model(cfg: Exp7Config) -> SegmentedResNet18:
+def _build_model(cfg: Exp7Config) -> SegmentedResNet18 | SegmentedMLP:
     """Backbone for the configured registry key."""
     if cfg.model == "resnet50":
         return SegmentedResNet50(num_classes=cfg.num_classes, pretrained=cfg.pretrained)
     if cfg.model == "resnet18":
         return SegmentedResNet18(num_classes=cfg.num_classes)
-    raise ValueError(f"unknown model {cfg.model!r}; expected 'resnet50' or 'resnet18'")
+    if cfg.model == "mlp":
+        return SegmentedMLP(in_dim=_MLP_IN_DIM, num_classes=cfg.num_classes)
+    raise ValueError(
+        f"unknown model {cfg.model!r}; expected 'resnet50', 'resnet18', or 'mlp'"
+    )
 
 
 # ======================================================================
@@ -326,7 +346,7 @@ class Exp7Runner:
     # ------------------------------------------------------------------
 
     def _make_trainer(
-        self, method: str, model: SegmentedResNet18, seed: int
+        self, method: str, model: SegmentedResNet18 | SegmentedMLP, seed: int
     ) -> Trainer:
         """Builds the Trainer for ``method``: optimizer slot or a second-order hook."""
         cfg = self._cfg
@@ -335,18 +355,19 @@ class Exp7Runner:
         if method == "adam":
             tcfg = replace(cfg.training, optimizer="adam", lr=_ADAM_LR)
             return Trainer(model, tcfg, self._device)
-        if method in ("kfac", "kfac+overlay"):
-            tau = math.inf if method == "kfac" else cfg.tau
+        if method in ("kfac", "kfac+overlay", "ekfac", "ekfac+overlay"):
+            tau = cfg.tau if method.endswith("+overlay") else math.inf
+            kind = "ekfac" if method.startswith("ekfac") else "kfac"
             hook = build_couplefac_hook(
-                model, cfg, tau=tau, seed=seed, device=self._device
+                model, cfg, tau=tau, kind=kind, seed=seed, device=self._device
             )
             return Trainer(model, cfg.training, self._device, step_hook=hook)
         if method == "newton_cg":
             hook = build_newton_cg_hook(model, cfg, device=self._device)
             return Trainer(model, cfg.training, self._device, step_hook=hook)
         raise ValueError(
-            f"unknown method {method!r}; expected one of "
-            "{'sgd', 'adam', 'kfac', 'kfac+overlay', 'newton_cg'}"
+            f"unknown method {method!r}; expected one of {{'sgd', 'adam', 'kfac', "
+            "'ekfac', 'kfac+overlay', 'ekfac+overlay', 'newton_cg'}}"
         )
 
     def _train_with_curve(

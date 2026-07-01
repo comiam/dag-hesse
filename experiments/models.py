@@ -659,6 +659,47 @@ class SegmentedWideResNet18(SegmentedResNet18):
         return _WideResNet([2, 2, 2, 2], num_classes, self._width_mult)
 
 
+class SegmentedMLP(nn.Module):
+    """Fully-connected classifier whose Linear layers are full-rank K-FAC/EKFAC blocks.
+
+    A low input dimension keeps every Kronecker factor full rank at a modest batch, so
+    EKFAC's eigenvalue correction is well conditioned and genuinely distinct from K-FAC -
+    the clean, full-rank setting for the optimizer-agnostic overlay comparison
+    (`Exp7Config.b1_mlp`), complementing the rank-deficient convolutional headline. Each
+    Linear layer is one parameter group (group-major ``fc0 .. fc{depth-1}`` then ``head``),
+    matching the layout the parameter-space estimator and the K-FAC / EKFAC providers share.
+    """
+
+    def __init__(
+        self,
+        *,
+        in_dim: int = 64,
+        hidden: int = 64,
+        depth: int = 3,
+        num_classes: int = 10,
+    ) -> None:
+        super().__init__()
+        widths = [in_dim] + [hidden] * depth
+        self.blocks = nn.ModuleList(
+            nn.Linear(widths[i], widths[i + 1]) for i in range(depth)
+        )
+        self.head = nn.Linear(hidden, num_classes)
+        self.act = nn.ReLU()
+
+    def forward(self, x: Tensor) -> Tensor:
+        h = x.flatten(1)
+        for block in self.blocks:
+            h = self.act(block(h))
+        return self.head(h)
+
+    def get_param_groups(self) -> dict[str, list[nn.Parameter]]:
+        groups: dict[str, list[nn.Parameter]] = {
+            f"fc{i}": list(block.parameters()) for i, block in enumerate(self.blocks)
+        }
+        groups["head"] = list(self.head.parameters())
+        return groups
+
+
 # ======================================================================
 # Toy-Attention & ReLU-MLP - Experiment 5
 # ======================================================================

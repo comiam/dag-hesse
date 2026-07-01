@@ -50,17 +50,24 @@ matches the gradient's supported sub-vector.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+import copy
+import logging
 from typing import cast
 
 import torch
 import torch.nn as nn
-from curvlinops import KFACInverseLinearOperator, KFACLinearOperator
+from curvlinops import (
+    EKFACLinearOperator,
+    KFACInverseLinearOperator,
+    KFACLinearOperator,
+)
 from torch import Tensor
 from torch.nn import Parameter
 
 from hessian.param_space import ParamGroupedModel
 from hessian.types import LayerID
+
+logger = logging.getLogger(__name__)
 
 # curvlinops K-FAC factorises these layer types; any other parameter (norm affine
 # weights, etc.) has no Kronecker curvature and falls back to the identity step.
@@ -76,6 +83,37 @@ def _build_ranges(groups: dict[LayerID, list[Parameter]]) -> dict[LayerID, slice
         ranges[name] = slice(offset, offset + size)
         offset += size
     return ranges
+
+
+def _classify_supported(
+    model: ParamGroupedModel, groups: dict[LayerID, list[Parameter]]
+) -> tuple[list[Parameter], Tensor]:
+    """Split the group-major flat layout into curvature-able params and a support mask.
+
+    The ``Linear`` / ``Conv2d`` parameters - the ones carrying Kronecker curvature - are
+    returned in group-major order (the layout curvlinops receives), and ``sup_mask`` flags
+    their positions in the flat parameter vector so ``base_direction`` routes the curvature
+    step to them and the identity step ``-g`` to every other parameter (norm affines, etc.).
+    ``model`` is walked as an ``nn.Module`` to classify the modules owning each parameter.
+    """
+    supported_ids = {
+        id(p)
+        for module in cast(nn.Module, model).modules()
+        if isinstance(module, _SUPPORTED)
+        for p in module.parameters(recurse=False)
+    }
+    total = sum(p.numel() for params in groups.values() for p in params)
+    sup_mask = torch.zeros(total, dtype=torch.bool)
+    kfac_params: list[Parameter] = []
+    offset = 0
+    for params in groups.values():
+        for p in params:
+            n = p.numel()
+            if id(p) in supported_ids:
+                kfac_params.append(p)
+                sup_mask[offset : offset + n] = True
+            offset += n
+    return kfac_params, sup_mask
 
 
 class CurvlinopsKFACProvider:
@@ -105,26 +143,8 @@ class CurvlinopsKFACProvider:
         self._ranges = _build_ranges(self._groups)
 
         # Per-parameter split (in flat-layout order): the Linear / Conv2d parameters go
-        # to curvlinops; the rest take the identity step. ``model`` is an nn.Module (it
-        # is handed to curvlinops as one), so walking its modules to classify is sound.
-        supported_ids = {
-            id(p)
-            for module in cast(nn.Module, model).modules()
-            if isinstance(module, _SUPPORTED)
-            for p in module.parameters(recurse=False)
-        }
-        total = sum(p.numel() for p in self._iter_params())
-        sup_mask = torch.zeros(total, dtype=torch.bool)
-        kfac_params: list[Parameter] = []
-        offset = 0
-        for p in self._iter_params():
-            n = p.numel()
-            if id(p) in supported_ids:
-                kfac_params.append(p)
-                sup_mask[offset : offset + n] = True
-            offset += n
-        self._kfac_params = kfac_params
-        self._sup_mask = sup_mask
+        # to curvlinops; the rest take the identity step.
+        self._kfac_params, self._sup_mask = _classify_supported(model, self._groups)
 
         self._inverse: KFACInverseLinearOperator | None = None
         self._ready = False
@@ -140,7 +160,16 @@ class CurvlinopsKFACProvider:
             if self._sup_mask.device != grad.device:
                 self._sup_mask = self._sup_mask.to(grad.device)
             mask = self._sup_mask
-            d0[mask] = -(self._inverse @ grad[mask])  # ... K-FAC where it applies
+            try:
+                d0[mask] = -(self._inverse @ grad[mask])  # ... K-FAC where it applies
+            except torch.linalg.LinAlgError:
+                # A degenerate Kronecker factor (non-positive-definite Cholesky) on this
+                # minibatch: take the identity step -grad on the K-FAC-able params rather
+                # than aborting the run (the no-harm safeguard, when active, backstops it).
+                logger.warning(
+                    "K-FAC factor inversion failed (non-positive-definite factor); "
+                    "taking the gradient step on this minibatch."
+                )
         return d0
 
     def block_ranges(self) -> dict[LayerID, slice]:
@@ -167,7 +196,130 @@ class CurvlinopsKFACProvider:
         self._ready = True
         return self
 
-    # -- internals -----------------------------------------------------
-    def _iter_params(self) -> Iterator[Parameter]:
-        for params in self._groups.values():
-            yield from params
+
+class CurvlinopsEKFACProvider:
+    """EKFAC provider backed by curvlinops (structurally implements `KFACProvider`).
+
+    EKFAC (eigenvalue-corrected K-FAC; George et al., 2018) keeps the K-FAC Kronecker
+    eigenbasis but rescales it by the exact diagonal variances measured in that basis - a
+    strictly finer block-diagonal curvature than K-FAC, and the second block-diagonal
+    baseline that demonstrates the overlay is optimizer-agnostic. It is wired exactly like
+    `CurvlinopsKFACProvider` - the same group-major layout, the same Linear/Conv2d support
+    split, the same identity step ``-g`` for norm parameters - with two curvlinops-imposed
+    differences forced by the eigenvalue correction:
+
+      * EKFAC supports only *exact* (eigenbasis) damping, so the inverse is built with
+        ``use_exact_damping=True`` instead of the factored Tikhonov damping K-FAC uses;
+      * that eigendecomposition of the raw Kronecker factors fails to converge (LAPACK
+        ``syevd`` on an ill-conditioned matrix) on the rank-deficient input factors of a
+        convolutional network in float32 - the same ill-conditioning that pushed K-FAC to
+        factored damping. EKFAC cannot sidestep the eigenbasis, so the factors are
+        collected and the eigendecomposition is run in float64 on a private double-
+        precision copy of the model, using the ``reduce`` Kronecker approximation (full-
+        rank C x C factors, which converge where the ``expand`` factors - C k^2 wide,
+        rank <= batch * spatial - do not). The resulting double direction is cast back to
+        the parameter dtype.
+
+    The double copy is built once and kept in eval mode; its weights and BatchNorm buffers
+    are synced from the live model on each refresh, so it tracks training without disturbing
+    the float32 model the estimator and optimizer share. The eigenbasis is refreshed only
+    every ``refresh_period`` updates (the eigendecomposition is the dominant cost), and a
+    non-convergent refresh keeps the previous eigenbasis rather than aborting the run.
+    """
+
+    def __init__(
+        self,
+        model: ParamGroupedModel,
+        loss_fn: nn.Module,
+        *,
+        damping: float = 1e-2,
+        fisher_type: str = "type-2",
+        refresh_period: int = 1,
+    ) -> None:
+        self._model = model
+        self._loss_fn = loss_fn
+        self._damping = damping
+        self._fisher_type = fisher_type
+        self._refresh_period = max(1, refresh_period)
+        self._calls = 0
+
+        self._groups = model.get_param_groups()
+        self._ranges = _build_ranges(self._groups)
+        _, self._sup_mask = _classify_supported(model, self._groups)
+
+        # Private float64 copy, kept in eval mode: EKFAC's eigenbasis is built here so the
+        # eigendecomposition runs in double precision on frozen-BatchNorm factors (the
+        # float32 / train-mode eigh diverges on conv factors). Its supported params, in the
+        # same group-major order, feed curvlinops.
+        self._double_model = copy.deepcopy(cast(nn.Module, model)).double().eval()
+        double_groups = cast(ParamGroupedModel, self._double_model).get_param_groups()
+        self._kfac_params, _ = _classify_supported(
+            cast(ParamGroupedModel, self._double_model), double_groups
+        )
+        self._dim_supported = sum(p.numel() for p in self._kfac_params)
+        self._device = (
+            self._kfac_params[0].device if self._kfac_params else torch.device("cpu")
+        )
+
+        self._inverse: KFACInverseLinearOperator | None = None
+        self._ready = False
+
+    # -- KFACProvider --------------------------------------------------
+    def base_direction(self, grad: Tensor) -> Tensor:
+        """d0 = -(EKFAC + lambda I)^{-1} grad on supported layers, -grad everywhere else."""
+        if not self._ready:
+            raise RuntimeError("call update(x, y) before base_direction(grad)")
+        grad = grad.detach()
+        d0 = -grad  # identity (gradient-descent) step ...
+        if self._inverse is not None:
+            if self._sup_mask.device != grad.device:
+                self._sup_mask = self._sup_mask.to(grad.device)
+            mask = self._sup_mask
+            # Solve in float64 (the eigenbasis dtype), then return in the param dtype.
+            sol = self._inverse @ grad[mask].double()
+            d0[mask] = -sol.to(grad.dtype)  # ... EKFAC where it applies
+        return d0
+
+    def block_ranges(self) -> dict[LayerID, slice]:
+        """Contiguous slice of the flat parameter vector owned by each group."""
+        return self._ranges
+
+    # -- curvature refresh ---------------------------------------------
+    def update(self, x: Tensor, y: Tensor) -> CurvlinopsEKFACProvider:
+        """Refresh the eigenvalue-corrected inverse every ``refresh_period`` updates."""
+        if self._kfac_params and self._calls % self._refresh_period == 0:
+            self._refresh(x, y)
+        self._calls += 1
+        self._ready = True
+        return self
+
+    def _refresh(self, x: Tensor, y: Tensor) -> None:
+        """Rebuild the float64 eigenbasis on the current weights; keep the last on failure."""
+        live = cast(nn.Module, self._model)
+        self._double_model.load_state_dict(live.state_dict())  # sync weights + buffers
+        operator = EKFACLinearOperator(
+            self._double_model,
+            self._loss_fn,
+            self._kfac_params,
+            [(x.double(), y)],
+            fisher_type=self._fisher_type,
+            kfac_approx="reduce",
+            check_deterministic=False,
+        )
+        inverse = KFACInverseLinearOperator(
+            operator, damping=self._damping, use_exact_damping=True
+        )
+        try:
+            # Force (and cache) the eigendecomposition now so a non-convergent factor
+            # surfaces here, not mid-step; the cached result then serves base_direction.
+            probe = torch.zeros(
+                self._dim_supported, dtype=torch.float64, device=self._device
+            )
+            _ = inverse @ probe
+        except torch.linalg.LinAlgError:
+            logger.warning(
+                "EKFAC eigendecomposition did not converge on this minibatch; keeping "
+                "the previous eigenbasis (gradient step until the next successful build)."
+            )
+            return
+        self._inverse = inverse

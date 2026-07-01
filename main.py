@@ -628,6 +628,7 @@ _DATASET_NUM_CLASSES = {
     "cifar10": 10,
     "cifar100": 100,
     "imagenet32": 1001,  # HF mirror keeps the index-0 background class
+    "synthetic": 10,  # low-dim synthetic task for the full-rank EKFAC control (b1_mlp)
 }
 
 
@@ -637,8 +638,9 @@ def _add_exp7_args(parser: argparse.ArgumentParser) -> None:
         "--profile",
         type=str,
         default="b1",
-        choices=["b1", "b2"],
+        choices=["b1", "b1_mlp", "b2"],
         help="b1: pretrained ResNet-50 finetune on Stanford Cars (headline); "
+        "b1_mlp: optimizer-agnostic control on a full-rank synthetic MLP (clean EKFAC); "
         "b2: large-batch ResNet from scratch on ImageNet-32 (control).",
     )
     # Optional overrides; a value of None leaves the profile default untouched.
@@ -646,10 +648,10 @@ def _add_exp7_args(parser: argparse.ArgumentParser) -> None:
         "--dataset",
         type=str,
         default=None,
-        choices=["stanford_cars", "cifar10", "cifar100", "imagenet32"],
+        choices=["stanford_cars", "cifar10", "cifar100", "imagenet32", "synthetic"],
     )
     parser.add_argument(
-        "--model", type=str, default=None, choices=["resnet50", "resnet18"]
+        "--model", type=str, default=None, choices=["resnet50", "resnet18", "mlp"]
     )
     parser.add_argument("--methods", type=str, nargs="+", default=None)
     parser.add_argument("--epochs", type=int, default=None)
@@ -667,6 +669,8 @@ def _make_exp7_config(args: argparse.Namespace) -> Exp7Config:
     """Selects the regime profile, then applies any explicit CLI overrides."""
     if args.profile == "b1":
         base = Exp7Config.b1_cars()
+    elif args.profile == "b1_mlp":
+        base = Exp7Config.b1_mlp()
     else:
         base = Exp7Config.b2_largebatch()
 
@@ -762,6 +766,7 @@ def _add_exp8_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--n-probes", type=int, default=None)
     parser.add_argument("--hessian-batch-size", type=int, default=None)
+    parser.add_argument("--num-workers", type=int, default=None)
 
 
 def _make_exp8_config(args: argparse.Namespace) -> Exp8Config:
@@ -795,6 +800,7 @@ def _make_exp8_config(args: argparse.Namespace) -> Exp8Config:
             "archs": args.archs,
             "n_probes": args.n_probes,
             "hessian_batch_size": args.hessian_batch_size,
+            "num_workers": args.num_workers,
         }.items()
         if value is not None
     }

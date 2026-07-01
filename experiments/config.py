@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 
 @dataclass
@@ -223,6 +223,10 @@ class Exp7Config:
     tr_radius: float = float("inf")  # trust-region radius for the no-harm safeguard
     damping: float = 1e-2  # K-FAC Tikhonov damping
     fisher_type: str = "type-2"  # curvlinops K-FAC Fisher type
+    # EKFAC rebuilds its eigenbasis only every this many steps - the eigendecomposition is
+    # its dominant cost, and periodic factor refresh is standard practice (K-FAC's cheaper
+    # factored step stays per-step). Only the EKFAC methods read this.
+    ekfac_refresh_period: int = 10
 
     # Comparison + demonstration
     methods: list[str] = field(
@@ -230,7 +234,9 @@ class Exp7Config:
             "sgd",
             "adam",
             "kfac",
+            "ekfac",
             "kfac+overlay",
+            "ekfac+overlay",
             "newton_cg",
         ]
     )
@@ -253,6 +259,40 @@ class Exp7Config:
         return cls()
 
     @classmethod
+    def b1_mlp(cls) -> Exp7Config:
+        """Optimizer-agnostic control on a full-rank (Linear) MLP - the clean EKFAC setting.
+
+        The convolutional headline (`b1_cars`) has rank-deficient Kronecker factors, where
+        EKFAC's eigenvalue correction is numerically delicate and close to K-FAC. This
+        profile reruns the same optimizer comparison on a low-dimensional synthetic task
+        whose Linear factors are full rank, so EKFAC is well conditioned and genuinely
+        distinct - evidence that the overlay is agnostic to the block-diagonal base
+        preconditioner, not specific to K-FAC.
+        """
+        return cls(
+            dataset="synthetic",
+            num_classes=10,
+            model="mlp",
+            pretrained=False,
+            augment=False,
+            # The label-noise ceiling is ~85%, and the from-scratch MLP has small initial
+            # curvature, so the damped-Newton family needs a larger damping than the
+            # pretrained-ResNet default (1e-2 diverges here) and a reachable target.
+            damping=0.1,
+            target_acc=0.7,
+            ekfac_refresh_period=1,
+            training=TrainingConfig(
+                lr=0.05,
+                batch_size=256,
+                epochs=20,
+                optimizer="sgd",
+                momentum=0.9,
+                weight_decay=1e-4,
+                scheduler="cosine",
+            ),
+        )
+
+    @classmethod
     def b2_largebatch(cls, batch_size: int = 1024) -> Exp7Config:
         """B2 control: large-batch ResNet trained from scratch on ImageNet-32 (32x32).
 
@@ -261,7 +301,7 @@ class Exp7Config:
         """
         return cls(
             dataset="imagenet32",
-            num_classes=1000,
+            num_classes=1001,  # HF mirror keeps the index-0 background class
             pretrained=False,
             image_size=32,
             target_acc=0.5,
@@ -299,10 +339,14 @@ class Exp8Config:
 
     # Backbones (each exposes group-major `get_param_groups`) + data
     archs: list[str] = field(default_factory=lambda: ["resnet18", "plain_resnet18"])
-    dataset: str = "cifar100"  # "cifar100" | "cifar10" | "stanford_cars"
+    dataset: str = "cifar100"  # "cifar100" | "cifar10" | "imagenet32" | "stanford_cars"
     num_classes: int = 100
     pretrained: bool = False  # ImageNet init (A2); False for from-scratch (A1)
     image_size: int = 32
+    # DataLoader workers for the heavy decode paths (ImageNet-32 / Stanford Cars); raise
+    # for the production ImageNet-32 anchor to clear the CPU-decode bottleneck. The light
+    # CIFAR loaders keep their own small default.
+    num_workers: int = 4
 
     # Phi estimation (Hutchinson on the parameter-space cross-block HVP)
     n_probes: int = 30
@@ -316,7 +360,7 @@ class Exp8Config:
         default_factory=lambda: TrainingConfig(
             lr=0.1,
             batch_size=128,
-            epochs=30,
+            epochs=100,
             optimizer="sgd",
             momentum=0.9,
             weight_decay=5e-4,
@@ -349,7 +393,11 @@ class Exp8Config:
         is not part of the default sweep. The mirror keeps the index-0 background class, so
         the head has 1001 outputs.
         """
-        return cls(dataset="imagenet32", num_classes=1001)
+        base = cls(dataset="imagenet32", num_classes=1001)
+        # ImageNet-32 is 1.28M images: 30 epochs is already a full cosine schedule
+        # (~300k steps), so this lighter budget is complete training, not a shortcut
+        # (100 epochs, the CIFAR-100 budget, would be wasteful overkill at this scale).
+        return replace(base, training=replace(base.training, epochs=30))
 
     @classmethod
     def a2_pretrained(cls) -> Exp8Config:
@@ -435,6 +483,8 @@ class Exp9Config:
                 "Qwen/Qwen2.5-1.5B",
                 "Qwen/Qwen2.5-3B",
                 "Qwen/Qwen2.5-7B",
+                "Qwen/Qwen2.5-14B",
+                "Qwen/Qwen2.5-32B",
                 "meta-llama/Llama-3.1-8B",
             ],
             seq_len=128,
