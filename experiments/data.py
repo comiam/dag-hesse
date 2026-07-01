@@ -7,8 +7,6 @@ import os
 import random
 from typing import Any
 
-import kagglehub
-import scipy.io as sio
 import torch
 import torchvision
 import torchvision.transforms as T
@@ -296,6 +294,8 @@ class _StanfordCarsSplit(Dataset):
 
 def _load_cars_train_samples(root: str) -> list[tuple[str, int]]:
     """Parse `cars_train_annos.mat` into [(image_path, label)] with labels in [0, 195]."""
+    import scipy.io as sio
+
     annos_path = os.path.join(root, "car_devkit", "devkit", "cars_train_annos.mat")
     images_dir = os.path.join(root, "cars_train", "cars_train")
     if not os.path.isfile(annos_path) or not os.path.isdir(images_dir):
@@ -331,8 +331,18 @@ def get_stanford_cars_loaders(
     per-class stratified split (see `_stratified_split`).
 
     Images are ImageNet-normalized; the train split uses fine-grained augmentation when
-    `augment` is set, matching the IMAGENET1K_V2 backbone used in Stage-B B1.
+    `augment` is set, matching the IMAGENET1K_V2 backbone used in Stage-B B1. ``kagglehub``
+    is imported lazily so the rest of the package imports without its kaggle API stack.
     """
+    try:
+        import kagglehub
+    except ImportError as exc:  # pragma: no cover - exercised only on the cars path
+        raise ImportError(
+            "Stanford Cars needs a working kagglehub install; it failed to import "
+            "(often a kagglehub / kagglesdk version skew). Try `uv add --upgrade "
+            "kagglehub` or remove a stale `kaggle` package."
+        ) from exc
+
     root = kagglehub.dataset_download(_CARS_KAGGLE_ID)
     samples = _load_cars_train_samples(root)
     labels = [label for _, label in samples]
